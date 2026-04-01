@@ -1,18 +1,27 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs }: let
+  outputs = { self, nixpkgs, crane }: let
     system = "x86_64-linux";
     pkgs = import nixpkgs { inherit system; };
+    craneLib = crane.mkLib pkgs;
 
-    crinj = pkgs.rustPlatform.buildRustPackage {
+    src = craneLib.cleanCargoSource ./.;
+
+    commonArgs = {
+      inherit src;
       pname = "crinj";
       version = "0.1.0";
-      src = ./.;
-      cargoLock.lockFile = ./Cargo.lock;
     };
+
+    cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+    crinj = craneLib.buildPackage (commonArgs // {
+      inherit cargoArtifacts;
+    });
 
   in {
     packages.${system} = {
@@ -82,14 +91,7 @@
     };
 
     devShells.${system}.default = pkgs.mkShell {
-      buildInputs = [
-        crinj
-        pkgs.cargo
-        pkgs.rustc
-        pkgs.gcc
-        pkgs.pkg-config
-        pkgs.openssl.dev
-      ];
+      inputsFrom = [ crinj ];
     };
   };
 }

@@ -191,14 +191,13 @@ name = "crinj"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "clap",
  "dashmap",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "pem",
  "rcgen",
- "ring",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -210,7 +209,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "webpki-roots 0.26.11",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1192,15 +1191,6 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.6",
 ]
 
 [[package]]

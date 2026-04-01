@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use dashmap::DashMap;
+use pem::Pem;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
@@ -292,18 +292,7 @@ impl CertificateAuthority {
 
 /// Encode raw DER bytes as a PEM-formatted certificate string.
 fn der_to_pem(der: &[u8]) -> String {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
-    // Pre-allocate: header (28) + base64 lines with newlines + footer (26)
-    let num_lines = b64.len().div_ceil(64);
-    let capacity = 28 + b64.len() + num_lines + 26;
-    let mut pem = String::with_capacity(capacity);
-    pem.push_str("-----BEGIN CERTIFICATE-----\n");
-    for chunk in b64.as_bytes().chunks(64) {
-        pem.push_str(std::str::from_utf8(chunk).expect("base64 is valid utf8"));
-        pem.push('\n');
-    }
-    pem.push_str("-----END CERTIFICATE-----\n");
-    pem
+    pem::encode(&Pem::new("CERTIFICATE", der))
 }
 
 #[cfg(test)]
