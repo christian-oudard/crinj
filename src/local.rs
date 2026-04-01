@@ -58,9 +58,6 @@ struct TomlInjection {
     /// Simple prefix prepended to the resolved value (convenience for `Bearer ` etc.).
     #[serde(default, rename = "value-prefix")]
     value_prefix: Option<String>,
-    /// When true, the request is blocked if the header cannot be set.
-    #[serde(default)]
-    require: Option<bool>,
 }
 
 // ── Resolved types ──────────────────────────────────────────────────────
@@ -107,15 +104,6 @@ fn resolve_injections(entries: &[TomlInjection], rules_path: &Path) -> Result<Ve
                 out.push(Injection::SetHeader {
                     name: entry.name.clone(),
                     value,
-                    require: entry.require.unwrap_or(false),
-                });
-            }
-            "replace_header" => {
-                let raw_value = resolve_value(entry, rules_path)?;
-                let value = format_value(&raw_value, &entry.value_format, &entry.value_prefix);
-                out.push(Injection::ReplaceHeader {
-                    name: entry.name.clone(),
-                    value,
                 });
             }
             "remove_header" => {
@@ -129,7 +117,6 @@ fn resolve_injections(entries: &[TomlInjection], rules_path: &Path) -> Result<Ve
                 out.push(Injection::SetQueryParam {
                     name: entry.name.clone(),
                     value,
-                    require: entry.require.unwrap_or(false),
                 });
             }
             other => bail!(
@@ -350,7 +337,6 @@ mod tests {
                 injections: vec![Injection::SetHeader {
                     name: "x-api-key".to_string(),
                     value: "sk-123".to_string(),
-                    require: false,
                 }],
             }],
         }];
@@ -368,7 +354,6 @@ mod tests {
                 injections: vec![Injection::SetHeader {
                     name: "x-api-key".to_string(),
                     value: "sk-123".to_string(),
-                    require: false,
                 }],
             }],
         }];
@@ -635,7 +620,6 @@ host = "api.stlouisfed.org"
 action = "set_query_param"
 name = "api_key"
 value-file = "{}"
-require = true
 "#,
                 secret.display()
             ),
@@ -645,14 +629,9 @@ require = true
         let rules = load(&rules_path).unwrap();
         assert_eq!(rules.len(), 1);
         match &rules[0].injection_rules[0].injections[0] {
-            Injection::SetQueryParam {
-                name,
-                value,
-                require,
-            } => {
+            Injection::SetQueryParam { name, value } => {
                 assert_eq!(name, "api_key");
                 assert_eq!(value, "MY_API_KEY");
-                assert!(*require);
             }
             other => panic!("expected SetQueryParam, got {:?}", other),
         }

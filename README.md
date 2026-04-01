@@ -44,7 +44,6 @@ host = "api.stlouisfed.org"
 action = "set_query_param"
 name = "api_key"
 value-file = "~/.config/crinj/secrets/fred.key"
-require = true
 
 # Inject a header from a file
 [[rules]]
@@ -54,7 +53,6 @@ action = "set_header"
 name = "Authorization"
 value-file = "~/.config/crinj/secrets/huggingface.key"
 value-prefix = "Bearer "
-require = true
 
 # Extract a value from a JSON file
 [[rules]]
@@ -65,7 +63,6 @@ name = "Authorization"
 value-file = "~/.cache/rhs/schwab_token.json"
 json-path = "token.access_token"
 value-prefix = "Bearer "
-require = true
 
 # Extract from a TOML config file
 [[rules]]
@@ -75,23 +72,22 @@ action = "set_header"
 name = "x-modal-token-id"
 value-file = "~/.config/modal/modal.toml"
 value-path = "default.token_id"
-require = true
 [[rules.inject]]
 action = "set_header"
 name = "x-modal-token-secret"
 value-file = "~/.config/modal/modal.toml"
 value-path = "default.token_secret"
-require = true
 ```
 
 ### Actions
 
+All actions require a placeholder: the header or query parameter must already exist in the request for injection to occur. The agent sends a dummy value, and Crinj replaces it with the real credential.
+
 | Action | Description |
 |---|---|
-| `set_header` | Set a header (overwrites if present) |
-| `replace_header` | Replace a header only if it already exists |
+| `set_header` | Replace a header's placeholder value with the real credential |
 | `remove_header` | Remove a header |
-| `set_query_param` | Add or replace a URL query parameter |
+| `set_query_param` | Replace a query parameter's placeholder value with the real credential |
 
 ### Value sources
 
@@ -113,7 +109,6 @@ require = true
 
 | Field | Description |
 |---|---|
-| `require` | When `true`, only inject if the header/param already exists in the request |
 | `host` | Hostname to match. Supports wildcards: `*.example.com` |
 | `path` | Path pattern. Default `*`. Supports prefix wildcards: `/v1/*` |
 

@@ -1,7 +1,8 @@
 //! Request injection engine.
 //!
-//! Applies injection rules (set_header, remove_header, set_query_param) to
-//! forwarded requests, with path pattern matching.
+//! Applies injection rules to forwarded requests, with path pattern matching.
+//! All injections require a placeholder: the header or query parameter must
+//! already exist in the request for injection to occur.
 
 use hyper::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -15,12 +16,6 @@ pub(crate) enum Injection {
     SetHeader {
         name: String,
         value: String,
-        #[serde(default)]
-        require: bool,
-    },
-    ReplaceHeader {
-        name: String,
-        value: String,
     },
     RemoveHeader {
         name: String,
@@ -28,8 +23,6 @@ pub(crate) enum Injection {
     SetQueryParam {
         name: String,
         value: String,
-        #[serde(default)]
-        require: bool,
     },
 }
 
@@ -57,16 +50,12 @@ pub(crate) fn apply_injections(
 
         for injection in &rule.injections {
             match injection {
-                Injection::SetHeader {
-                    name,
-                    value,
-                    require,
-                } => {
+                Injection::SetHeader { name, value } => {
                     if let (Ok(header_name), Ok(header_value)) = (
                         HeaderName::from_bytes(name.as_bytes()),
                         HeaderValue::from_str(value),
                     ) {
-                        if *require && !headers.contains_key(&header_name) {
+                        if !headers.contains_key(&header_name) {
                             continue;
                         }
                         headers.insert(header_name, header_value);
@@ -76,16 +65,6 @@ pub(crate) fn apply_injections(
                             header = %name,
                             "injection skipped: invalid header name or value"
                         );
-                    }
-                }
-                Injection::ReplaceHeader { name, value } => {
-                    if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
-                        if headers.contains_key(&header_name) {
-                            if let Ok(header_value) = HeaderValue::from_str(value) {
-                                headers.insert(header_name, header_value);
-                                count += 1;
-                            }
-                        }
                     }
                 }
                 Injection::RemoveHeader { name } => {
@@ -128,13 +107,8 @@ pub(crate) fn apply_query_injections(
             continue;
         }
         for injection in &rule.injections {
-            if let Injection::SetQueryParam {
-                name,
-                value,
-                require,
-            } = injection
-            {
-                if *require && !existing_params.contains(name.as_str()) {
+            if let Injection::SetQueryParam { name, value } = injection {
+                if !existing_params.contains(name.as_str()) {
                     continue;
                 }
                 params_to_set.push((name, value));
@@ -253,7 +227,6 @@ mod tests {
         Injection::SetHeader {
             name: name.to_string(),
             value: value.to_string(),
-            require: false,
         }
     }
 
@@ -264,9 +237,10 @@ mod tests {
     }
 
     #[test]
-    fn inject_set_header() {
+    fn inject_set_header_replaces_placeholder() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("accept", HeaderValue::from_static("application/json"));
+        headers.insert("x-api-key", HeaderValue::from_static("PLACEHOLDER"));
 
         let rules = vec![make_rule("*", vec![set_header("x-api-key", "sk-ant-123")])];
 
@@ -274,6 +248,18 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-123");
         assert_eq!(headers.get("accept").unwrap(), "application/json");
+    }
+
+    #[test]
+    fn inject_set_header_skips_when_no_placeholder() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+
+        let rules = vec![make_rule("*", vec![set_header("x-api-key", "sk-ant-123")])];
+
+        let count = apply_injections(&mut headers, "/v1/messages", &rules);
+        assert_eq!(count, 0);
+        assert!(headers.get("x-api-key").is_none());
     }
 
     #[test]
@@ -292,46 +278,6 @@ mod tests {
         let count = apply_injections(&mut headers, "/", &rules);
         assert_eq!(count, 1);
         assert_eq!(headers.get("authorization").unwrap(), "Bearer new-token");
-    }
-
-    #[test]
-    fn inject_replace_header_when_present() {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer placeholder"),
-        );
-
-        let rules = vec![make_rule(
-            "*",
-            vec![Injection::ReplaceHeader {
-                name: "authorization".to_string(),
-                value: "Bearer real-token".to_string(),
-            }],
-        )];
-
-        let count = apply_injections(&mut headers, "/", &rules);
-        assert_eq!(count, 1);
-        assert_eq!(headers.get("authorization").unwrap(), "Bearer real-token");
-    }
-
-    #[test]
-    fn inject_replace_header_skips_when_absent() {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert("x-api-key", HeaderValue::from_static("temp-key"));
-
-        let rules = vec![make_rule(
-            "*",
-            vec![Injection::ReplaceHeader {
-                name: "authorization".to_string(),
-                value: "Bearer real-token".to_string(),
-            }],
-        )];
-
-        let count = apply_injections(&mut headers, "/", &rules);
-        assert_eq!(count, 0);
-        assert!(headers.get("authorization").is_none());
-        assert_eq!(headers.get("x-api-key").unwrap(), "temp-key");
     }
 
     #[test]
@@ -362,6 +308,7 @@ mod tests {
     #[test]
     fn inject_combined_set_and_remove() {
         let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("PLACEHOLDER"));
         headers.insert("authorization", HeaderValue::from_static("Bearer old"));
 
         let rules = vec![make_rule(
@@ -381,6 +328,7 @@ mod tests {
     #[test]
     fn inject_path_mismatch_skips_rule() {
         let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("PLACEHOLDER"));
 
         let rules = vec![make_rule(
             "/v1/*",
@@ -389,12 +337,13 @@ mod tests {
 
         let count = apply_injections(&mut headers, "/v2/messages", &rules);
         assert_eq!(count, 0);
-        assert!(headers.get("x-api-key").is_none());
+        assert_eq!(headers.get("x-api-key").unwrap(), "PLACEHOLDER");
     }
 
     #[test]
     fn inject_multiple_rules_different_paths() {
         let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("PLACEHOLDER"));
 
         let rules = vec![
             make_rule("/v1/*", vec![set_header("x-api-key", "key-v1")]),
@@ -421,25 +370,26 @@ mod tests {
         Injection::SetQueryParam {
             name: name.to_string(),
             value: value.to_string(),
-            require: false,
         }
     }
 
     #[test]
-    fn query_inject_adds_param() {
+    fn query_inject_skips_when_no_placeholder() {
         let rules = vec![make_rule("*", vec![set_query_param("api_key", "abc123")])];
         let (result, count) = apply_query_injections("/fred/series", &rules);
-        assert_eq!(count, 1);
-        assert_eq!(result, "/fred/series?api_key=abc123");
+        assert_eq!(count, 0);
+        assert_eq!(result, "/fred/series");
     }
 
     #[test]
-    fn query_inject_preserves_existing_params() {
+    fn query_inject_replaces_placeholder() {
         let rules = vec![make_rule("*", vec![set_query_param("api_key", "abc123")])];
-        let (result, count) = apply_query_injections("/fred/series?series_id=GDP", &rules);
+        let (result, count) =
+            apply_query_injections("/fred/series?api_key=PLACEHOLDER&series_id=GDP", &rules);
         assert_eq!(count, 1);
         assert!(result.contains("series_id=GDP"));
         assert!(result.contains("api_key=abc123"));
+        assert!(!result.contains("PLACEHOLDER"));
     }
 
     #[test]
@@ -455,9 +405,9 @@ mod tests {
     #[test]
     fn query_inject_no_match_returns_unchanged() {
         let rules = vec![make_rule("/v1/*", vec![set_query_param("key", "val")])];
-        let (result, count) = apply_query_injections("/v2/foo", &rules);
+        let (result, count) = apply_query_injections("/v2/foo?key=PLACEHOLDER", &rules);
         assert_eq!(count, 0);
-        assert_eq!(result, "/v2/foo");
+        assert_eq!(result, "/v2/foo?key=PLACEHOLDER");
     }
 
     #[test]
@@ -466,7 +416,7 @@ mod tests {
             "*",
             vec![set_query_param("q", "hello world&more")],
         )];
-        let (result, _) = apply_query_injections("/search", &rules);
+        let (result, _) = apply_query_injections("/search?q=PLACEHOLDER", &rules);
         assert!(result.contains("q=hello%20world%26more"));
     }
 
@@ -479,7 +429,8 @@ mod tests {
                 set_query_param("file_type", "json"),
             ],
         )];
-        let (result, count) = apply_query_injections("/fred/series", &rules);
+        let (result, count) =
+            apply_query_injections("/fred/series?api_key=PH&file_type=PH", &rules);
         assert_eq!(count, 2);
         assert!(result.contains("api_key=abc"));
         assert!(result.contains("file_type=json"));
@@ -494,24 +445,20 @@ mod tests {
                 set_query_param("api_key", "abc"),
             ],
         )];
-        let (result, count) = apply_query_injections("/path", &rules);
+        let (result, count) = apply_query_injections("/path?api_key=PH", &rules);
         assert_eq!(count, 1);
         assert!(result.contains("api_key=abc"));
         assert!(!result.contains("x-api-key"));
     }
 
-    // ── require ─────────────────────────────────────────────────────────
+    // ── placeholder requirement ────────────────────────────────────────
 
     #[test]
-    fn require_header_skips_when_missing() {
+    fn header_skips_when_no_placeholder() {
         let mut headers = hyper::HeaderMap::new();
         let rules = vec![make_rule(
             "*",
-            vec![Injection::SetHeader {
-                name: "x-api-key".to_string(),
-                value: "secret".to_string(),
-                require: true,
-            }],
+            vec![set_header("x-api-key", "secret")],
         )];
         let count = apply_injections(&mut headers, "/", &rules);
         assert_eq!(count, 0);
@@ -519,16 +466,12 @@ mod tests {
     }
 
     #[test]
-    fn require_header_injects_when_present() {
+    fn header_injects_when_placeholder_present() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("PLACEHOLDER"));
         let rules = vec![make_rule(
             "*",
-            vec![Injection::SetHeader {
-                name: "x-api-key".to_string(),
-                value: "real-secret".to_string(),
-                require: true,
-            }],
+            vec![set_header("x-api-key", "real-secret")],
         )];
         let count = apply_injections(&mut headers, "/", &rules);
         assert_eq!(count, 1);
@@ -536,14 +479,10 @@ mod tests {
     }
 
     #[test]
-    fn require_query_skips_when_missing() {
+    fn query_skips_when_no_placeholder() {
         let rules = vec![make_rule(
             "*",
-            vec![Injection::SetQueryParam {
-                name: "api_key".to_string(),
-                value: "secret".to_string(),
-                require: true,
-            }],
+            vec![set_query_param("api_key", "secret")],
         )];
         let (result, count) = apply_query_injections("/path", &rules);
         assert_eq!(count, 0);
@@ -551,14 +490,10 @@ mod tests {
     }
 
     #[test]
-    fn require_query_injects_when_present() {
+    fn query_injects_when_placeholder_present() {
         let rules = vec![make_rule(
             "*",
-            vec![Injection::SetQueryParam {
-                name: "api_key".to_string(),
-                value: "real-secret".to_string(),
-                require: true,
-            }],
+            vec![set_query_param("api_key", "real-secret")],
         )];
         let (result, count) = apply_query_injections("/path?api_key=PLACEHOLDER", &rules);
         assert_eq!(count, 1);

@@ -35,9 +35,10 @@ action = "set_header"
 name = "authorization"
 value-file = "~/.secrets/api-key"
 value-prefix = "Bearer "
-require = true
 ```
 
-Actions: `set_header`, `replace_header`, `remove_header`, `set_query_param`
+All injections require placeholders: the header or query param must already exist in the request.
+
+Actions: `set_header`, `remove_header`, `set_query_param`
 Value sources: `value` (inline), `value-file` (from file), `value-path` (extract from JSON/TOML file)
 Value formatting: `value-format` (`{value}` substitution), `value-prefix`
