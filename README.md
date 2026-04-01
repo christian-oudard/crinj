@@ -1,6 +1,6 @@
 # Crinj
 
-**CR**edential **INJ**ector. A local MITM proxy that injects API credentials into outbound HTTP requests based on declarative TOML rules.
+**CR**edential **INJ**ector. A local MITM proxy that injects API credentials into outbound HTTP requests based on declarative TOML config.
 
 Designed for sandboxing AI agents and CLI tools that need API access without direct credential access. The agent talks through Crinj, which transparently adds the right headers or query parameters before forwarding to the real API.
 
@@ -8,7 +8,7 @@ Designed for sandboxing AI agents and CLI tools that need API access without dir
 
 1. Configure your agent to use `http://127.0.0.1:10255` as its HTTP proxy
 2. Crinj intercepts HTTPS requests, generates a TLS certificate for each target host, and forwards the request upstream
-3. For hosts matching your rules, Crinj injects credentials (headers or query params) before forwarding
+3. For hosts matching your config, Crinj injects credentials (headers or query params) before forwarding
 4. For unmatched hosts, traffic is tunneled through without interception
 
 ## Install
@@ -25,92 +25,86 @@ nix run .#crinj
 ## Usage
 
 ```bash
-crinj --rules-file ~/.config/crinj/rules.toml
+crinj --config ~/.config/crinj/config.toml
 ```
 
 On first run, Crinj generates a CA certificate at `~/.local/share/crinj/gateway/ca.pem`. Trust this CA in your agent's environment to avoid TLS errors.
 
-Send `SIGHUP` to reload rules without restarting.
+Send `SIGHUP` to reload config without restarting.
 
-## Rules
+## Config
 
-Rules are defined in TOML. Each rule matches a hostname and injects credentials into matching requests.
+Host entries are defined in TOML. Each entry matches a domain and injects credentials into matching requests. All injections require a placeholder: the header or query parameter must already exist in the request. The agent sends a dummy value, and Crinj replaces it with the real credential.
+
+Most entries need a single rule, written inline:
 
 ```toml
-# Inject an API key as a query parameter
-[[rules]]
-host = "api.stlouisfed.org"
-[[rules.inject]]
-action = "set_query_param"
-name = "api_key"
-value-file = "~/.config/crinj/secrets/fred.key"
+[[host]]
+domain = "huggingface.co"
+source = "~/.config/crinj/secrets/huggingface.key"
+header = "Authorization"
+format = "Bearer {}"
 
-# Inject a header from a file
-[[rules]]
-host = "huggingface.co"
-[[rules.inject]]
-action = "set_header"
-name = "Authorization"
-value-file = "~/.config/crinj/secrets/huggingface.key"
-value-prefix = "Bearer "
+[[host]]
+domain = "api.stlouisfed.org"
+source = "~/.config/crinj/secrets/fred.key"
+query-param = "api_key"
 
-# Extract a value from a JSON file
-[[rules]]
-host = "api.schwabapi.com"
-[[rules.inject]]
-action = "set_header"
-name = "Authorization"
-value-file = "~/.cache/rhs/schwab_token.json"
-json-path = "token.access_token"
-value-prefix = "Bearer "
-
-# Extract from a TOML config file
-[[rules]]
-host = "api.modal.com"
-[[rules.inject]]
-action = "set_header"
-name = "x-modal-token-id"
-value-file = "~/.config/modal/modal.toml"
-value-path = "default.token_id"
-[[rules.inject]]
-action = "set_header"
-name = "x-modal-token-secret"
-value-file = "~/.config/modal/modal.toml"
-value-path = "default.token_secret"
+[[host]]
+domain = "api.schwabapi.com"
+source = "~/.cache/rhs/schwab_token.json"
+source-path = "token.access_token"
+header = "Authorization"
+format = "Bearer {}"
 ```
 
-### Actions
+For multiple rules per host, use `[[host.rule]]` sub-tables (which inherit the host-level `source`):
 
-All actions require a placeholder: the header or query parameter must already exist in the request for injection to occur. The agent sends a dummy value, and Crinj replaces it with the real credential.
+```toml
+[[host]]
+domain = "api.modal.com"
+source = "~/.config/modal/modal.toml"
+[[host.rule]]
+source-path = "christian-oudard.token_id"
+header = "x-modal-token-id"
+[[host.rule]]
+source-path = "christian-oudard.token_secret"
+header = "x-modal-token-secret"
+```
 
-| Action | Description |
-|---|---|
-| `set_header` | Replace a header's placeholder value with the real credential |
-| `remove_header` | Remove a header |
-| `set_query_param` | Replace a query parameter's placeholder value with the real credential |
+For other multi-rule cases:
 
-### Value sources
+```toml
+[[host]]
+domain = "api.example.com"
+[[host.rule]]
+source = "~/.config/creds.toml"
+source-path = "account.token"
+header = "x-token"
+format = "Bearer {}"
+[[host.rule]]
+remove-header = "x-debug"
+```
+
+### Host fields
 
 | Field | Description |
 |---|---|
-| `value` | Inline literal value |
-| `value-file` | Read value from a file (trimmed) |
-| `value-path` | Dot-notation path into a structured file (format auto-detected from extension) |
-| `json-path` | Alias for `value-path` on JSON files |
+| `domain` | Domain to match. Supports wildcards: `*.example.com` |
+| `source` | Default source file, inherited by rules |
 
-### Value formatting
+### Rule fields
 
 | Field | Description |
 |---|---|
-| `value-format` | Format string with `{value}` placeholder |
-| `value-prefix` | Prepend a string (convenience for `Bearer ` etc.) |
-
-### Options
-
-| Field | Description |
-|---|---|
-| `host` | Hostname to match. Supports wildcards: `*.example.com` |
-| `path` | Path pattern. Default `*`. Supports prefix wildcards: `/v1/*` |
+| `source` | Read value from a file (trimmed). Overrides host-level source |
+| `value` | Inline literal value (alternative to source) |
+| `source-path` | Dot-notation path into a structured source file (auto-detects JSON/TOML). Numeric segments index arrays |
+| `header` | Header to set |
+| `query-param` | Query parameter to set |
+| `remove-header` | Header to remove (no value needed) |
+| `format` | Format string, `{}` is replaced with the resolved value (e.g. `"Bearer {}"`) |
+| `url-path` | URL path pattern. Default `*`. Supports prefix wildcards: `/v1/*` |
 
 ## NixOS
 
@@ -122,7 +116,7 @@ All actions require a placeholder: the header or query parameter must already ex
 
   services.crinj = {
     enable = true;
-    rulesFile = ./rules.toml;
+    configFile = ./config.toml;
   };
 }
 ```

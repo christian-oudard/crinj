@@ -33,9 +33,9 @@
           description = "Port for the MITM proxy";
         };
 
-        rulesFile = lib.mkOption {
+        configFile = lib.mkOption {
           type = lib.types.path;
-          description = "Path to the rules TOML file";
+          description = "Path to the config TOML file";
         };
 
         dataDir = lib.mkOption {
@@ -61,7 +61,7 @@
 
           serviceConfig = {
             Type = "simple";
-            ExecStart = "${cfg.package}/bin/crinj --port ${toString cfg.port} --data-dir ${cfg.dataDir} --rules-file ${cfg.rulesFile}";
+            ExecStart = "${cfg.package}/bin/crinj --port ${toString cfg.port} --data-dir ${cfg.dataDir} --config ${cfg.configFile}";
             StateDirectory = "crinj";
             DynamicUser = true;
             Restart = "on-failure";

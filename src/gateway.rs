@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use crate::ca::CertificateAuthority;
 use crate::inject::{self, InjectionRule};
-use crate::local::ResolvedLocalRule;
+use crate::local::ResolvedHost;
 
 // ── GatewayServer ───────────────────────────────────────────────────────
 
@@ -27,8 +27,8 @@ pub struct GatewayServer {
     upstream_tls: Arc<TlsConnector>,
     port: u16,
     bind_addr: String,
-    rules: Arc<std::sync::RwLock<Vec<ResolvedLocalRule>>>,
-    rules_path: PathBuf,
+    rules: Arc<std::sync::RwLock<Vec<ResolvedHost>>>,
+    config_path: PathBuf,
 }
 
 impl GatewayServer {
@@ -36,8 +36,8 @@ impl GatewayServer {
         ca: CertificateAuthority,
         port: u16,
         bind_addr: String,
-        rules: Vec<ResolvedLocalRule>,
-        rules_path: PathBuf,
+        rules: Vec<ResolvedHost>,
+        config_path: PathBuf,
     ) -> Self {
         let client_config = build_upstream_tls_config(
             std::env::var("GATEWAY_DANGER_ACCEPT_INVALID_CERTS").is_ok(),
@@ -48,7 +48,7 @@ impl GatewayServer {
             port,
             bind_addr,
             rules: Arc::new(std::sync::RwLock::new(rules)),
-            rules_path,
+            config_path,
         }
     }
 
@@ -101,14 +101,14 @@ impl GatewayServer {
     }
 
     fn handle_sighup(&self) {
-        match crate::local::load(&self.rules_path) {
+        match crate::local::load(&self.config_path) {
             Ok(new_rules) => {
                 let count = new_rules.len();
                 *self.rules.write().unwrap() = new_rules;
-                info!(rule_count = count, "SIGHUP: reloaded rules");
+                info!(host_count = count, "SIGHUP: reloaded config");
             }
             Err(e) => {
-                warn!(error = %e, "SIGHUP: failed to reload rules, keeping old ones");
+                warn!(error = %e, "SIGHUP: failed to reload config, keeping old one");
             }
         }
     }
@@ -178,7 +178,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     ca: Arc<CertificateAuthority>,
     upstream_tls: Arc<TlsConnector>,
-    rules: Arc<std::sync::RwLock<Vec<ResolvedLocalRule>>>,
+    rules: Arc<std::sync::RwLock<Vec<ResolvedHost>>>,
 ) -> Result<()> {
     let io = TokioIo::new(stream);
 
@@ -216,7 +216,7 @@ async fn handle_connect(
     peer_addr: SocketAddr,
     ca: Arc<CertificateAuthority>,
     upstream_tls: Arc<TlsConnector>,
-    rules: Arc<std::sync::RwLock<Vec<ResolvedLocalRule>>>,
+    rules: Arc<std::sync::RwLock<Vec<ResolvedHost>>>,
 ) -> Result<Response<Empty<Bytes>>, anyhow::Error> {
     let host = req
         .uri()

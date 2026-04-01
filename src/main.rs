@@ -31,9 +31,9 @@ struct Cli {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Path to the rules TOML file.
+    /// Path to the config TOML file.
     #[arg(long)]
-    rules_file: Option<PathBuf>,
+    config: Option<PathBuf>,
 }
 
 // ── XDG path resolution ─────────────────────────────────────────────────
@@ -49,7 +49,7 @@ fn resolve_data_dir(explicit: Option<&Path>) -> PathBuf {
     xdg_data_home().join("crinj")
 }
 
-fn resolve_rules_file(explicit: Option<&Path>) -> PathBuf {
+fn resolve_config_file(explicit: Option<&Path>) -> PathBuf {
     if let Some(p) = explicit {
         return expand_tilde(p);
     }
@@ -57,7 +57,7 @@ fn resolve_rules_file(explicit: Option<&Path>) -> PathBuf {
     if legacy.is_file() {
         return legacy;
     }
-    xdg_config_home().join("crinj").join("rules.toml")
+    xdg_config_home().join("crinj").join("config.toml")
 }
 
 fn xdg_data_home() -> PathBuf {
@@ -86,22 +86,22 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let data_dir = resolve_data_dir(cli.data_dir.as_deref());
-    let rules_path = resolve_rules_file(cli.rules_file.as_deref());
+    let config_path = resolve_config_file(cli.config.as_deref());
 
     info!(data_dir = %data_dir.display(), "starting crinj");
 
     let ca = CertificateAuthority::load_or_generate(&data_dir).await?;
 
-    let rules = local::load(&rules_path)?;
+    let hosts = local::load(&config_path)?;
     info!(
-        rules_file = %rules_path.display(),
-        rule_count = rules.len(),
-        "loaded rules (send SIGHUP to reload)"
+        config = %config_path.display(),
+        host_count = hosts.len(),
+        "loaded config (send SIGHUP to reload)"
     );
 
     info!(port = cli.port, bind = %cli.bind, "ready");
 
-    let server = GatewayServer::new(ca, cli.port, cli.bind, rules, rules_path);
+    let server = GatewayServer::new(ca, cli.port, cli.bind, hosts, config_path);
     server.run().await
 }
 
