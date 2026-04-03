@@ -57,7 +57,7 @@ fn resolve_config_file(explicit: Option<&Path>) -> PathBuf {
     if legacy.is_file() {
         return legacy;
     }
-    xdg_config_home().join("crinj").join("config.toml")
+    xdg_config_home().join("crinj").join("rules.toml")
 }
 
 fn xdg_data_home() -> PathBuf {

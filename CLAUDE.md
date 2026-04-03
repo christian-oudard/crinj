@@ -7,7 +7,7 @@ Local MITM proxy that injects credentials into outbound HTTP requests based on T
 ```bash
 cargo build                    # Build
 cargo test                     # Run tests
-cargo run -- --config config.toml  # Run with config
+cargo run -- --config rules.toml  # Run with config
 nix build                     # Nix build
 nix develop                   # Dev shell
 ```

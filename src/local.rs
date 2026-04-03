@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn load_inline_header() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -482,7 +482,7 @@ value = "sk-inline-123"
         let secret_path = dir.path().join("secret.key");
         std::fs::write(&secret_path, "sk-from-file-456\n").unwrap();
 
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             format!(
@@ -510,7 +510,7 @@ source = "{}"
         let secret_path = dir.path().join("token.key");
         std::fs::write(&secret_path, "hf_abc123\n").unwrap();
 
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             format!(
@@ -539,7 +539,7 @@ format = "Bearer {{}}"
         let secret = dir.path().join("fred.key");
         std::fs::write(&secret, "MY_API_KEY\n").unwrap();
 
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             format!(
@@ -567,7 +567,7 @@ source = "{}"
     #[test]
     fn load_inline_remove_header() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -601,7 +601,7 @@ token_secret = "as-PsX-test456"
         )
         .unwrap();
 
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             format!(
@@ -647,7 +647,7 @@ source-path = "christian-oudard.token_secret"
         let json_file = dir.path().join("creds.json");
         std::fs::write(&json_file, r#"{"token": {"access_token": "abc123"}}"#).unwrap();
 
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             format!(
@@ -677,7 +677,7 @@ format = "Bearer {{}}"
         let file = dir.path().join("creds.yaml");
         std::fs::write(&file, "key: value").unwrap();
 
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             format!(
@@ -703,7 +703,7 @@ source-path = "key"
         let json_file = dir.path().join("creds.json");
         std::fs::write(&json_file, r#"{"tokens": ["first", "second"]}"#).unwrap();
 
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             format!(
@@ -731,7 +731,7 @@ header = "Authorization"
     #[test]
     fn load_empty_config() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(&config_path, "").unwrap();
 
         let hosts = load(&config_path).unwrap();
@@ -741,7 +741,7 @@ header = "Authorization"
     #[test]
     fn load_multiple_hosts() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -767,7 +767,7 @@ value = "Bearer hf-tok"
     #[test]
     fn load_mix_inline_and_subtable_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -802,7 +802,7 @@ secret = "as-test456"
         )
         .unwrap();
 
-        let config_path = dir.path().join("config.toml");
+        let config_path = dir.path().join("rules.toml");
         std::fs::write(
             &config_path,
             format!(

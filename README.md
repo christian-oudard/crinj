@@ -25,7 +25,7 @@ nix run .#crinj
 ## Usage
 
 ```bash
-crinj --config ~/.config/crinj/config.toml
+crinj --config ~/.config/crinj/rules.toml
 ```
 
 On first run, Crinj generates a CA certificate at `~/.local/share/crinj/gateway/ca.pem`. Trust this CA in your agent's environment to avoid TLS errors.
@@ -116,7 +116,7 @@ remove-header = "x-debug"
 
   services.crinj = {
     enable = true;
-    configFile = ./config.toml;
+    configFile = ./rules.toml;
   };
 }
 ```
