@@ -99,15 +99,6 @@ impl RuleEntry {
     fn has_action(&self) -> bool {
         self.header.is_some() || self.query_param.is_some() || self.remove_header.is_some()
     }
-
-    /// The target name (header or query param name) for error messages.
-    fn target_name(&self) -> &str {
-        self.header
-            .as_deref()
-            .or(self.query_param.as_deref())
-            .or(self.remove_header.as_deref())
-            .unwrap_or("?")
-    }
 }
 
 // ── Resolved types ──────────────────────────────────────────────────────
@@ -156,9 +147,11 @@ fn resolve_host_rules(entry: &HostEntry, config_path: &Path) -> Result<Vec<Injec
     // For inline, serde(flatten) means source is consumed by the host-level field,
     // so the inline RuleEntry always has source = None.
     let fallback_source = entry.source.as_deref();
+    let domain = &entry.domain;
 
     if has_inline {
-        let injection = resolve_injection(&entry.inline, fallback_source, config_path)?;
+        let injection =
+            resolve_injection(&entry.inline, fallback_source, domain, config_path)?;
         return Ok(vec![InjectionRule {
             path_pattern: entry.inline.url_path.clone(),
             injections: vec![injection],
@@ -169,7 +162,7 @@ fn resolve_host_rules(entry: &HostEntry, config_path: &Path) -> Result<Vec<Injec
         .rule
         .iter()
         .map(|rule| {
-            let injection = resolve_injection(rule, fallback_source, config_path)?;
+            let injection = resolve_injection(rule, fallback_source, domain, config_path)?;
             Ok(InjectionRule {
                 path_pattern: rule.url_path.clone(),
                 injections: vec![injection],
@@ -183,6 +176,7 @@ fn resolve_host_rules(entry: &HostEntry, config_path: &Path) -> Result<Vec<Injec
 fn resolve_injection(
     rule: &RuleEntry,
     fallback_source: Option<&str>,
+    domain: &str,
     config_path: &Path,
 ) -> Result<Injection> {
     if let Some(ref name) = rule.remove_header {
@@ -191,7 +185,7 @@ fn resolve_injection(
         });
     }
     if let Some(ref name) = rule.header {
-        let raw = resolve_value(rule, fallback_source, config_path)?;
+        let raw = resolve_value(rule, fallback_source, domain, config_path)?;
         let value = format_value(&raw, &rule.format);
         return Ok(Injection::SetHeader {
             name: name.clone(),
@@ -199,7 +193,7 @@ fn resolve_injection(
         });
     }
     if let Some(ref name) = rule.query_param {
-        let raw = resolve_value(rule, fallback_source, config_path)?;
+        let raw = resolve_value(rule, fallback_source, domain, config_path)?;
         let value = format_value(&raw, &rule.format);
         return Ok(Injection::SetQueryParam {
             name: name.clone(),
@@ -207,7 +201,8 @@ fn resolve_injection(
         });
     }
     bail!(
-        "rule in {} must have `header`, `query-param`, or `remove-header`",
+        "rule for domain {:?} in {} must have `header`, `query-param`, or `remove-header`",
+        domain,
         config_path.display()
     );
 }
@@ -225,23 +220,22 @@ fn format_value(raw: &str, format: &Option<String>) -> String {
 fn resolve_value(
     rule: &RuleEntry,
     fallback_source: Option<&str>,
+    domain: &str,
     config_path: &Path,
 ) -> Result<String> {
-    let target = rule.target_name();
-
     if let Some(ref v) = rule.value {
         return Ok(v.clone());
     }
 
     let source = rule.source.as_deref().or(fallback_source);
     if let Some(source) = source {
-        let expanded = expand_tilde(source);
-        check_file_permissions(&expanded);
+        let expanded = resolve_source_path(source, config_path);
+        check_file_permissions(&expanded)?;
         let content = std::fs::read_to_string(&expanded).with_context(|| {
             format!(
-                "reading source {} (for {:?}) referenced from {}",
+                "reading source {} (for domain {:?}) referenced from {}",
                 expanded.display(),
-                target,
+                domain,
                 config_path.display()
             )
         })?;
@@ -249,10 +243,10 @@ fn resolve_value(
         if let Some(ref sp) = rule.source_path {
             return extract_path(&content, sp, &expanded).with_context(|| {
                 format!(
-                    "extracting source-path {:?} from {} (for {:?})",
+                    "extracting source-path {:?} from {} (for domain {:?})",
                     sp,
                     expanded.display(),
-                    target
+                    domain
                 )
             });
         }
@@ -260,27 +254,29 @@ fn resolve_value(
         return Ok(content.trim().to_string());
     }
     bail!(
-        "rule for {:?} in {} has neither `value` nor `source`",
-        target,
+        "rule for domain {:?} in {} has neither `value` nor `source`",
+        domain,
         config_path.display()
     );
 }
 
-/// Warn if a secret file has group/world-readable permissions.
-fn check_file_permissions(_path: &Path) {
+/// Refuse to load a secret file with group/world-readable permissions.
+fn check_file_permissions(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if let Ok(meta) = std::fs::metadata(_path) {
-            if meta.mode() & 0o077 != 0 {
-                tracing::warn!(
-                    path = %_path.display(),
-                    mode = format!("{:o}", meta.mode() & 0o777),
-                    "secret file has group/world permissions, consider chmod 600"
+            let mode = meta.mode() & 0o777;
+            if mode & 0o077 != 0 {
+                bail!(
+                    "secret file {} has mode {:o} — must not be group/world-accessible (chmod 600)",
+                    _path.display(),
+                    mode,
                 );
             }
         }
     }
+    Ok(())
 }
 
 /// Auto-detect format from file extension and extract a dot-separated path.
@@ -376,11 +372,35 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Resolve a source path from the config file.
+/// Absolute (`/...`) and home-relative (`~/...`) paths are used as-is.
+/// Bare names are resolved relative to a `secrets/` directory next to the config file.
+fn resolve_source_path(source: &str, config_path: &Path) -> PathBuf {
+    if source.starts_with('/') || source.starts_with("~/") {
+        return expand_tilde(source);
+    }
+    let secrets_dir = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("secrets");
+    secrets_dir.join(source)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write a secret file with 0o600 permissions.
+    fn write_secret(path: &Path, content: &str) {
+        std::fs::write(path, content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
 
     // ── domain_matches ──────────────────────────────────────────────────
 
@@ -480,7 +500,7 @@ value = "sk-inline-123"
     fn load_inline_header_from_file() {
         let dir = tempfile::tempdir().unwrap();
         let secret_path = dir.path().join("secret.key");
-        std::fs::write(&secret_path, "sk-from-file-456\n").unwrap();
+        write_secret(&secret_path, "sk-from-file-456\n");
 
         let config_path = dir.path().join("rules.toml");
         std::fs::write(
@@ -508,7 +528,7 @@ source = "{}"
     fn load_inline_with_format() {
         let dir = tempfile::tempdir().unwrap();
         let secret_path = dir.path().join("token.key");
-        std::fs::write(&secret_path, "hf_abc123\n").unwrap();
+        write_secret(&secret_path, "hf_abc123\n");
 
         let config_path = dir.path().join("rules.toml");
         std::fs::write(
@@ -537,7 +557,7 @@ format = "Bearer {{}}"
     fn load_inline_query_param() {
         let dir = tempfile::tempdir().unwrap();
         let secret = dir.path().join("fred.key");
-        std::fs::write(&secret, "MY_API_KEY\n").unwrap();
+        write_secret(&secret, "MY_API_KEY\n");
 
         let config_path = dir.path().join("rules.toml");
         std::fs::write(
@@ -591,15 +611,14 @@ remove-header = "authorization"
     fn load_rule_subtable() {
         let dir = tempfile::tempdir().unwrap();
         let toml_file = dir.path().join("modal.toml");
-        std::fs::write(
+        write_secret(
             &toml_file,
             r#"
 [christian-oudard]
 token_id = "ak-oDO-test123"
 token_secret = "as-PsX-test456"
 "#,
-        )
-        .unwrap();
+        );
 
         let config_path = dir.path().join("rules.toml");
         std::fs::write(
@@ -645,7 +664,7 @@ source-path = "christian-oudard.token_secret"
     fn load_source_path_from_json() {
         let dir = tempfile::tempdir().unwrap();
         let json_file = dir.path().join("creds.json");
-        std::fs::write(&json_file, r#"{"token": {"access_token": "abc123"}}"#).unwrap();
+        write_secret(&json_file, r#"{"token": {"access_token": "abc123"}}"#);
 
         let config_path = dir.path().join("rules.toml");
         std::fs::write(
@@ -675,7 +694,7 @@ format = "Bearer {{}}"
     fn load_source_path_unknown_extension_fails() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("creds.yaml");
-        std::fs::write(&file, "key: value").unwrap();
+        write_secret(&file, "key: value");
 
         let config_path = dir.path().join("rules.toml");
         std::fs::write(
@@ -701,7 +720,7 @@ source-path = "key"
     fn load_source_path_array_index() {
         let dir = tempfile::tempdir().unwrap();
         let json_file = dir.path().join("creds.json");
-        std::fs::write(&json_file, r#"{"tokens": ["first", "second"]}"#).unwrap();
+        write_secret(&json_file, r#"{"tokens": ["first", "second"]}"#);
 
         let config_path = dir.path().join("rules.toml");
         std::fs::write(
@@ -786,21 +805,78 @@ value = "extra-val"
         assert!(format!("{err:?}").contains("inline fields or [[host.rule]]"));
     }
 
+    // ── load: permissions ───────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_world_readable_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("secret.key");
+        std::fs::write(&secret_path, "sk-test\n").unwrap();
+        // default 644 — should be rejected
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "example.com"
+header = "x-api-key"
+source = "{}"
+"#,
+                secret_path.display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(format!("{err:?}").contains("must not be group/world-accessible"));
+    }
+
+    // ── load: relative source paths ───────────────────────────────────
+
+    #[test]
+    fn load_relative_source_resolves_to_secrets_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir(&secrets_dir).unwrap();
+        let secret_path = secrets_dir.join("my.key");
+        write_secret(&secret_path, "sk-relative-789\n");
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "example.com"
+header = "x-api-key"
+source = "my.key"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        match &hosts[0].injection_rules[0].injections[0] {
+            Injection::SetHeader { value, .. } => assert_eq!(value, "sk-relative-789"),
+            other => panic!("expected SetHeader, got {:?}", other),
+        }
+    }
+
     // ── load: host-level source inheritance ────────────────────────────
 
     #[test]
     fn load_rules_inherit_host_source() {
         let dir = tempfile::tempdir().unwrap();
         let toml_file = dir.path().join("creds.toml");
-        std::fs::write(
+        write_secret(
             &toml_file,
             r#"
 [account]
 id = "ak-test123"
 secret = "as-test456"
 "#,
-        )
-        .unwrap();
+        );
 
         let config_path = dir.path().join("rules.toml");
         std::fs::write(

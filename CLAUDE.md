@@ -27,14 +27,14 @@ flake.nix      # Nix build + NixOS module
 ## Config format
 
 ```toml
-# Inline single rule (most common)
+# Inline single rule (most common) — bare source name resolves to secrets/ dir
 [[host]]
 domain = "api.example.com"
-source = "~/.secrets/api-key"
+source = "api-key"
 header = "authorization"
 format = "Bearer {}"
 
-# Multiple rules from one source file
+# Multiple rules from one source file (absolute/~ paths also work)
 [[host]]
 domain = "api.example.com"
 source = "~/.config/example/creds.toml"
@@ -49,6 +49,8 @@ header = "x-token-secret"
 All injections require placeholders: the header or query param must already exist in the request.
 
 Value sources: `source` (from file), `value` (inline literal), `source-path` (extract from JSON/TOML file)
+Source path resolution: bare names → `<config_dir>/secrets/<name>`, `~/...` → home-relative, `/...` → absolute
 Actions: `header`, `query-param`, `remove-header`
 Formatting: `format` (`{}` substitution)
 Filtering: `url-path` (default `*`)
+Secret files must be chmod 600 (no group/world access) or crinj refuses to start.
