@@ -92,6 +92,7 @@
 
     devShells.${system}.default = pkgs.mkShell {
       inputsFrom = [ crinj ];
+      packages = [ pkgs.clippy pkgs.rustfmt ];
     };
   };
 }
