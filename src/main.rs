@@ -5,7 +5,7 @@ mod local;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -34,6 +34,11 @@ struct Cli {
     /// Path to the config TOML file.
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// Permit starting with zero host rules. Without this flag, an empty
+    /// config is rejected because it would tunnel all traffic unchanged.
+    #[arg(long)]
+    allow_empty_rules: bool,
 }
 
 // ── XDG path resolution ─────────────────────────────────────────────────
@@ -93,15 +98,35 @@ async fn main() -> Result<()> {
     let ca = CertificateAuthority::load_or_generate(&data_dir).await?;
 
     let hosts = local::load(&config_path)?;
+    if hosts.is_empty() && !cli.allow_empty_rules {
+        bail!(
+            "config {} has no host rules. Refusing to start: this would tunnel \
+             all traffic unchanged. If that is intended, pass --allow-empty-rules.",
+            config_path.display()
+        );
+    }
     info!(
         config = %config_path.display(),
         host_count = hosts.len(),
         "loaded config (send SIGHUP to reload)"
     );
+    if hosts.is_empty() {
+        info!(
+            config = %config_path.display(),
+            "starting in passthrough mode: --allow-empty-rules set and config has no rules; all traffic will tunnel through unchanged"
+        );
+    }
 
     info!(port = cli.port, bind = %cli.bind, "ready");
 
-    let server = GatewayServer::new(ca, cli.port, cli.bind, hosts, config_path);
+    let server = GatewayServer::new(
+        ca,
+        cli.port,
+        cli.bind,
+        hosts,
+        config_path,
+        cli.allow_empty_rules,
+    );
     server.run().await
 }
 

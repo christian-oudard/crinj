@@ -29,6 +29,7 @@ pub struct GatewayServer {
     bind_addr: String,
     rules: Arc<std::sync::RwLock<Vec<ResolvedHost>>>,
     config_path: PathBuf,
+    allow_empty_rules: bool,
 }
 
 impl GatewayServer {
@@ -38,6 +39,7 @@ impl GatewayServer {
         bind_addr: String,
         rules: Vec<ResolvedHost>,
         config_path: PathBuf,
+        allow_empty_rules: bool,
     ) -> Self {
         let client_config = build_upstream_tls_config(
             std::env::var("GATEWAY_DANGER_ACCEPT_INVALID_CERTS").is_ok(),
@@ -49,6 +51,7 @@ impl GatewayServer {
             bind_addr,
             rules: Arc::new(std::sync::RwLock::new(rules)),
             config_path,
+            allow_empty_rules,
         }
     }
 
@@ -103,9 +106,23 @@ impl GatewayServer {
     fn handle_sighup(&self) {
         match crate::local::load(&self.config_path) {
             Ok(new_rules) => {
+                if new_rules.is_empty() && !self.allow_empty_rules {
+                    warn!(
+                        config = %self.config_path.display(),
+                        "SIGHUP: reloaded config has no host rules; rejecting reload \
+                         and keeping old rules (start with --allow-empty-rules to permit)"
+                    );
+                    return;
+                }
                 let count = new_rules.len();
                 *self.rules.write().unwrap() = new_rules;
                 info!(host_count = count, "SIGHUP: reloaded config");
+                if count == 0 {
+                    info!(
+                        config = %self.config_path.display(),
+                        "SIGHUP: reloaded config has no rules; running in passthrough mode (--allow-empty-rules)"
+                    );
+                }
             }
             Err(e) => {
                 warn!(error = %e, "SIGHUP: failed to reload config, keeping old one");
