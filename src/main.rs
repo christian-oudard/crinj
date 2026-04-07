@@ -11,7 +11,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::ca::CertificateAuthority;
-use crate::gateway::GatewayServer;
+use crate::gateway::{GatewayServer, UpstreamProxy};
 
 #[derive(Parser)]
 #[command(
@@ -97,6 +97,11 @@ async fn main() -> Result<()> {
 
     let ca = CertificateAuthority::load_or_generate(&data_dir).await?;
 
+    let upstream_proxy = UpstreamProxy::from_env()?;
+    if let Some(ref p) = upstream_proxy {
+        info!(addr = %p.addr(), "upstream proxy: routing outbound CONNECT through parent");
+    }
+
     let hosts = local::load(&config_path)?;
     if hosts.is_empty() && !cli.allow_empty_rules {
         bail!(
@@ -126,6 +131,7 @@ async fn main() -> Result<()> {
         hosts,
         config_path,
         cli.allow_empty_rules,
+        upstream_proxy,
     );
     server.run().await
 }
