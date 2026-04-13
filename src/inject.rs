@@ -6,7 +6,7 @@
 
 use hyper::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 // ── Data types ──────────────────────────────────────────────────────────
 
@@ -58,7 +58,8 @@ pub(crate) fn apply_injections(
                         if !headers.contains_key(&header_name) {
                             continue;
                         }
-                        headers.insert(header_name, header_value);
+                        headers.insert(header_name.clone(), header_value);
+                        debug!(header = %header_name, "injected header");
                         count += 1;
                     } else {
                         warn!(
@@ -70,6 +71,7 @@ pub(crate) fn apply_injections(
                 Injection::RemoveHeader { name } => {
                     if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
                         if headers.remove(&header_name).is_some() {
+                            debug!(header = %header_name, "removed header");
                             count += 1;
                         }
                     }
@@ -121,6 +123,9 @@ pub(crate) fn apply_query_injections(
     }
 
     let count = params_to_set.len();
+    for (name, _) in &params_to_set {
+        debug!(param = %name, "injected query param");
+    }
 
     let inject_names: std::collections::HashSet<&str> =
         params_to_set.iter().map(|(n, _)| *n).collect();
