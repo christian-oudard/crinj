@@ -3,9 +3,10 @@ mod gateway;
 mod inject;
 mod local;
 
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -39,6 +40,10 @@ struct Cli {
     /// config is rejected because it would tunnel all traffic unchanged.
     #[arg(long)]
     allow_empty_rules: bool,
+
+    /// Write log output to a file instead of stderr.
+    #[arg(long)]
+    log_file: Option<PathBuf>,
 }
 
 // ── XDG path resolution ─────────────────────────────────────────────────
@@ -85,10 +90,23 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("failed to install rustls CryptoProvider");
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
-
     let cli = Cli::parse();
+
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if let Some(ref log_file) = cli.log_file {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file)
+            .with_context(|| format!("opening log file {}", log_file.display()))?;
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(file)
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     let data_dir = resolve_data_dir(cli.data_dir.as_deref());
     let config_path = resolve_config_file(cli.config.as_deref());
