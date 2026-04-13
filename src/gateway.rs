@@ -26,6 +26,7 @@ use crate::local::ResolvedHost;
 pub struct GatewayServer {
     ca: Arc<CertificateAuthority>,
     upstream_tls: Arc<TlsConnector>,
+    upstream_tls_no_check: Arc<TlsConnector>,
     upstream_proxy: Arc<Option<UpstreamProxy>>,
     port: u16,
     bind_addr: String,
@@ -47,9 +48,11 @@ impl GatewayServer {
         let client_config = build_upstream_tls_config(
             std::env::var("GATEWAY_DANGER_ACCEPT_INVALID_CERTS").is_ok(),
         );
+        let no_check_config = build_upstream_tls_config(true);
         Self {
             ca: Arc::new(ca),
             upstream_tls: Arc::new(TlsConnector::from(Arc::new(client_config))),
+            upstream_tls_no_check: Arc::new(TlsConnector::from(Arc::new(no_check_config))),
             upstream_proxy: Arc::new(upstream_proxy),
             port,
             bind_addr,
@@ -96,12 +99,13 @@ impl GatewayServer {
     fn spawn_connection(&self, stream: TcpStream, peer_addr: SocketAddr) {
         let ca = Arc::clone(&self.ca);
         let upstream_tls = Arc::clone(&self.upstream_tls);
+        let upstream_tls_no_check = Arc::clone(&self.upstream_tls_no_check);
         let upstream_proxy = Arc::clone(&self.upstream_proxy);
         let rules = Arc::clone(&self.rules);
 
         tokio::spawn(async move {
             if let Err(e) =
-                handle_connection(stream, peer_addr, ca, upstream_tls, upstream_proxy, rules).await
+                handle_connection(stream, peer_addr, ca, upstream_tls, upstream_tls_no_check, upstream_proxy, rules).await
             {
                 warn!(peer = %peer_addr, error = %e, "connection error");
             }
@@ -200,6 +204,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     ca: Arc<CertificateAuthority>,
     upstream_tls: Arc<TlsConnector>,
+    upstream_tls_no_check: Arc<TlsConnector>,
     upstream_proxy: Arc<Option<UpstreamProxy>>,
     rules: Arc<std::sync::RwLock<Vec<ResolvedHost>>>,
 ) -> Result<()> {
@@ -213,11 +218,12 @@ async fn handle_connection(
             service_fn(move |req: Request<Incoming>| {
                 let ca = Arc::clone(&ca);
                 let upstream_tls = Arc::clone(&upstream_tls);
+                let upstream_tls_no_check = Arc::clone(&upstream_tls_no_check);
                 let upstream_proxy = Arc::clone(&upstream_proxy);
                 let rules = Arc::clone(&rules);
                 async move {
                     if req.method() == Method::CONNECT {
-                        handle_connect(req, peer_addr, ca, upstream_tls, upstream_proxy, rules)
+                        handle_connect(req, peer_addr, ca, upstream_tls, upstream_tls_no_check, upstream_proxy, rules)
                             .await
                     } else if req.uri().path() == "/healthz" {
                         Ok(Response::new(Empty::new()))
@@ -241,6 +247,7 @@ async fn handle_connect(
     peer_addr: SocketAddr,
     ca: Arc<CertificateAuthority>,
     upstream_tls: Arc<TlsConnector>,
+    upstream_tls_no_check: Arc<TlsConnector>,
     upstream_proxy: Arc<Option<UpstreamProxy>>,
     rules: Arc<std::sync::RwLock<Vec<ResolvedHost>>>,
 ) -> Result<Response<Empty<Bytes>>, anyhow::Error> {
@@ -255,6 +262,12 @@ async fn handle_connect(
     let resolved = {
         let rules = rules.read().unwrap();
         crate::local::resolve(&host, &rules)
+    };
+
+    let upstream_tls = if resolved.no_check_certificate {
+        upstream_tls_no_check
+    } else {
+        upstream_tls
     };
 
     let via_proxy = upstream_proxy

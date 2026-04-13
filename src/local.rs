@@ -29,7 +29,7 @@ struct Config {
 /// [[host]]
 /// domain = "api.example.com"
 /// source = "~/.secrets/key"
-/// header = "Authorization"
+/// header = "authorization"
 /// format = "Bearer {}"
 /// ```
 ///
@@ -45,12 +45,19 @@ struct Config {
 /// source-path = "account.token_secret"
 /// header = "x-token-secret"
 /// ```
+///
+/// Canonical field order: matching (domain, url-path, ports),
+/// TLS (no-check-certificate), source (source, source-path, value),
+/// action (header, query-param, remove-header), modifiers (format).
 #[derive(Deserialize)]
 struct HostEntry {
     domain: String,
     /// Optional port filter. If omitted, matches any port.
     #[serde(default)]
     ports: Vec<u16>,
+    /// Skip upstream TLS certificate verification for this host.
+    #[serde(default, rename = "no-check-certificate")]
+    no_check_certificate: bool,
     /// Default source file (inherited by rule entries).
     #[serde(default)]
     source: Option<String>,
@@ -70,16 +77,22 @@ fn default_path() -> String {
 /// Exactly one of `header`, `query_param`, or `remove_header` must be set.
 #[derive(Deserialize, Default)]
 struct RuleEntry {
+    // Matching
+    /// URL path pattern. Default `*`. Supports `/v1/*` prefix wildcards.
+    #[serde(default = "default_path", rename = "url-path")]
+    url_path: String,
+    // Source
     /// Path to a file containing the value (read at startup).
     #[serde(default)]
     source: Option<String>,
-    /// Inline literal value.
-    #[serde(default)]
-    value: Option<String>,
     /// Dot-notation path into a structured `source` file.
     /// Segments are keys or array indices. Format auto-detected from extension.
     #[serde(default, rename = "source-path")]
     source_path: Option<String>,
+    /// Inline literal value.
+    #[serde(default)]
+    value: Option<String>,
+    // Action
     /// Header name (implies set_header action).
     #[serde(default)]
     header: Option<String>,
@@ -89,12 +102,10 @@ struct RuleEntry {
     /// Header name to remove (implies remove_header action).
     #[serde(default, rename = "remove-header")]
     remove_header: Option<String>,
+    // Modifiers
     /// Optional format string. `{}` is replaced with the resolved value.
     #[serde(default)]
     format: Option<String>,
-    /// URL path pattern. Default `*`. Supports `/v1/*` prefix wildcards.
-    #[serde(default = "default_path", rename = "url-path")]
-    url_path: String,
 }
 
 impl RuleEntry {
@@ -112,6 +123,8 @@ pub(crate) struct ResolvedHost {
     pub host_pattern: String,
     /// Empty = match any port.
     pub ports: Vec<u16>,
+    /// Skip upstream TLS certificate verification for this host.
+    pub no_check_certificate: bool,
     pub injection_rules: Vec<InjectionRule>,
 }
 
@@ -136,6 +149,7 @@ pub(crate) fn load(path: &Path) -> Result<Vec<ResolvedHost>> {
         resolved.push(ResolvedHost {
             host_pattern: entry.domain,
             ports: entry.ports,
+            no_check_certificate: entry.no_check_certificate,
             injection_rules,
         });
     }
@@ -348,6 +362,7 @@ fn extract_toml_path(content: &str, path: &str) -> Result<String> {
 /// Result of resolving a host against the config.
 pub(crate) struct ResolveResult {
     pub intercept: bool,
+    pub no_check_certificate: bool,
     pub injection_rules: Vec<InjectionRule>,
 }
 
@@ -356,13 +371,16 @@ pub(crate) struct ResolveResult {
 pub(crate) fn resolve(host: &str, hosts: &[ResolvedHost]) -> ResolveResult {
     let (hostname, port) = split_host_port(host);
     let mut rules = Vec::new();
+    let mut no_check_certificate = false;
     for h in hosts {
         if domain_matches(hostname, &h.host_pattern) && h.port_matches(port) {
             rules.extend(h.injection_rules.iter().cloned());
+            no_check_certificate = no_check_certificate || h.no_check_certificate;
         }
     }
     ResolveResult {
         intercept: !rules.is_empty(),
+        no_check_certificate,
         injection_rules: rules,
     }
 }
@@ -480,7 +498,7 @@ mod tests {
         let hosts = vec![ResolvedHost {
             host_pattern: "35.194.69.156".to_string(),
             ports: vec![443],
-
+            no_check_certificate: false,
             injection_rules: vec![InjectionRule {
                 path_pattern: "*".to_string(),
                 injections: vec![Injection::SetHeader {
@@ -499,7 +517,7 @@ mod tests {
         let hosts = vec![ResolvedHost {
             host_pattern: "35.194.69.156".to_string(),
             ports: vec![443],
-
+            no_check_certificate: false,
             injection_rules: vec![InjectionRule {
                 path_pattern: "*".to_string(),
                 injections: vec![Injection::SetHeader {
@@ -518,7 +536,7 @@ mod tests {
         let hosts = vec![ResolvedHost {
             host_pattern: "api.example.com".to_string(),
             ports: vec![],
-
+            no_check_certificate: false,
             injection_rules: vec![InjectionRule {
                 path_pattern: "*".to_string(),
                 injections: vec![Injection::SetHeader {
@@ -536,7 +554,7 @@ mod tests {
         let hosts = vec![ResolvedHost {
             host_pattern: "35.194.69.156".to_string(),
             ports: vec![443, 8443],
-
+            no_check_certificate: false,
             injection_rules: vec![InjectionRule {
                 path_pattern: "*".to_string(),
                 injections: vec![Injection::SetHeader {
@@ -557,7 +575,7 @@ mod tests {
         let hosts = vec![ResolvedHost {
             host_pattern: "api.anthropic.com".to_string(),
             ports: vec![],
-
+            no_check_certificate: false,
             injection_rules: vec![InjectionRule {
                 path_pattern: "*".to_string(),
                 injections: vec![Injection::SetHeader {
@@ -576,7 +594,7 @@ mod tests {
         let hosts = vec![ResolvedHost {
             host_pattern: "api.anthropic.com".to_string(),
             ports: vec![],
-
+            no_check_certificate: false,
             injection_rules: vec![InjectionRule {
                 path_pattern: "*".to_string(),
                 injections: vec![Injection::SetHeader {
@@ -907,6 +925,65 @@ value = "sk-123"
 
         let hosts = load(&config_path).unwrap();
         assert!(hosts[0].ports.is_empty());
+    }
+
+    // ── load: no-check-certificate ───────────────────────────────────
+
+    #[test]
+    fn load_no_check_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "10.0.0.1"
+no-check-certificate = true
+header = "authorization"
+value = "Bearer tok"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert!(hosts[0].no_check_certificate);
+    }
+
+    #[test]
+    fn load_no_check_certificate_defaults_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "api.example.com"
+header = "x-api-key"
+value = "sk-123"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert!(!hosts[0].no_check_certificate);
+    }
+
+    #[test]
+    fn resolve_propagates_no_check_certificate() {
+        let hosts = vec![ResolvedHost {
+            host_pattern: "10.0.0.1".to_string(),
+            ports: vec![],
+            no_check_certificate: true,
+            injection_rules: vec![InjectionRule {
+                path_pattern: "*".to_string(),
+                injections: vec![Injection::SetHeader {
+                    name: "authorization".to_string(),
+                    value: "Bearer tok".to_string(),
+                }],
+            }],
+        }];
+        let r = resolve("10.0.0.1:8443", &hosts);
+        assert!(r.no_check_certificate);
     }
 
     // ── load: misc ─────────────────────────────────────────────────────

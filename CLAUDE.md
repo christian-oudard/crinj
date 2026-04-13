@@ -48,9 +48,12 @@ header = "x-token-secret"
 
 All injections require placeholders: the header or query param must already exist in the request.
 
-Value sources: `source` (from file), `value` (inline literal), `source-path` (extract from JSON/TOML file)
+Canonical field order:
+- Matching: `domain`, `url-path` (default `*`), `ports` (array of u16, default all)
+- TLS: `no-check-certificate` (bool, default false) skips upstream cert verification per host
+- Source: `source` (from file), `source-path` (extract from JSON/TOML file), `value` (inline literal)
+- Action: `header`, `query-param`, `remove-header`
+- Modifiers: `format` (`{}` substitution)
+
 Source path resolution: bare names → `<config_dir>/secrets/<name>`, `~/...` → home-relative, `/...` → absolute
-Actions: `header`, `query-param`, `remove-header`
-Formatting: `format` (`{}` substitution)
-Filtering: `url-path` (default `*`), `ports` (array of u16, default all)
 Secret files must be chmod 600 (no group/world access) or crinj refuses to start.
