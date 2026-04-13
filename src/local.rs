@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use rustls::pki_types::CertificateDer;
+
 use crate::inject::{Injection, InjectionRule};
 
 // ── TOML schema ─────────────────────────────────────────────────────────
@@ -48,6 +50,12 @@ struct Config {
 #[derive(Deserialize)]
 struct HostEntry {
     domain: String,
+    /// Optional port filter. If omitted, matches any port.
+    #[serde(default)]
+    ports: Vec<u16>,
+    /// Custom CA certificate for upstream TLS (PEM file path).
+    #[serde(default, rename = "ca-cert")]
+    ca_cert: Option<String>,
     /// Default source file (inherited by rule entries).
     #[serde(default)]
     source: Option<String>,
@@ -107,7 +115,17 @@ impl RuleEntry {
 #[derive(Debug)]
 pub(crate) struct ResolvedHost {
     pub host_pattern: String,
+    /// Empty = match any port.
+    pub ports: Vec<u16>,
+    /// Custom CA certs for upstream TLS. Empty = use default roots.
+    pub ca_certs: Vec<CertificateDer<'static>>,
     pub injection_rules: Vec<InjectionRule>,
+}
+
+impl ResolvedHost {
+    fn port_matches(&self, port: Option<u16>) -> bool {
+        self.ports.is_empty() || port.map_or(false, |p| self.ports.contains(&p))
+    }
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────
@@ -122,8 +140,14 @@ pub(crate) fn load(path: &Path) -> Result<Vec<ResolvedHost>> {
     let mut resolved = Vec::with_capacity(config.host.len());
     for entry in config.host {
         let injection_rules = resolve_host_rules(&entry, path)?;
+        let ca_certs = match &entry.ca_cert {
+            Some(cert_path) => load_pem_certs(&resolve_source_path(cert_path, path))?,
+            None => vec![],
+        };
         resolved.push(ResolvedHost {
             host_pattern: entry.domain,
+            ports: entry.ports,
+            ca_certs,
             injection_rules,
         });
     }
@@ -260,6 +284,19 @@ fn resolve_value(
     );
 }
 
+/// Load PEM-encoded certificates from a file and validate them as trust anchors.
+fn load_pem_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let data = std::fs::read(path)
+        .with_context(|| format!("reading CA cert {}", path.display()))?;
+    let certs: Vec<_> = rustls_pemfile::certs(&mut &data[..])
+        .collect::<std::result::Result<_, _>>()
+        .with_context(|| format!("parsing PEM certs from {}", path.display()))?;
+    if certs.is_empty() {
+        bail!("no certificates found in {}", path.display());
+    }
+    Ok(certs)
+}
+
 /// Refuse to load a secret file with group/world-readable permissions.
 fn check_file_permissions(_path: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -333,19 +370,56 @@ fn extract_toml_path(content: &str, path: &str) -> Result<String> {
 
 // ── Runtime resolution ──────────────────────────────────────────────────
 
-/// Find all host entries matching a hostname. Returns `(intercept, rules)`.
-pub(crate) fn resolve(hostname: &str, hosts: &[ResolvedHost]) -> (bool, Vec<InjectionRule>) {
-    let mut matched = Vec::new();
-    for host in hosts {
-        if domain_matches(hostname, &host.host_pattern) {
-            matched.extend(host.injection_rules.iter().cloned());
+/// Result of resolving a host against the config.
+pub(crate) struct ResolveResult {
+    pub intercept: bool,
+    pub injection_rules: Vec<InjectionRule>,
+    /// Custom CA certs from the first matching host that has them.
+    pub ca_certs: Vec<CertificateDer<'static>>,
+}
+
+/// Find all host entries matching a hostname and port.
+/// `host` is the raw CONNECT authority, e.g. `example.com:443`.
+pub(crate) fn resolve(host: &str, hosts: &[ResolvedHost]) -> ResolveResult {
+    let (hostname, port) = split_host_port(host);
+    let mut rules = Vec::new();
+    let mut ca_certs = Vec::new();
+    for h in hosts {
+        if domain_matches(hostname, &h.host_pattern) && h.port_matches(port) {
+            rules.extend(h.injection_rules.iter().cloned());
+            if ca_certs.is_empty() && !h.ca_certs.is_empty() {
+                ca_certs = h.ca_certs.clone();
+            }
         }
     }
-    if matched.is_empty() {
-        (false, vec![])
-    } else {
-        (true, matched)
+    ResolveResult {
+        intercept: !rules.is_empty(),
+        injection_rules: rules,
+        ca_certs,
     }
+}
+
+/// Split a `host:port` string into (hostname, optional port number).
+fn split_host_port(s: &str) -> (&str, Option<u16>) {
+    // Bracketed IPv6: [::1]:443
+    if s.starts_with('[') {
+        if let Some(bracket_end) = s.find(']') {
+            if let Some(port_str) = s[bracket_end + 1..].strip_prefix(':') {
+                if let Ok(port) = port_str.parse() {
+                    return (&s[1..bracket_end], Some(port));
+                }
+            }
+            return (&s[1..bracket_end], None);
+        }
+        return (s, None);
+    }
+    if let Some(colon_pos) = s.rfind(':') {
+        let port_str = &s[colon_pos + 1..];
+        if let Ok(port) = port_str.parse() {
+            return (&s[..colon_pos], Some(port));
+        }
+    }
+    (s, None)
 }
 
 /// Check if a hostname matches a domain pattern (`*.suffix` wildcard or exact).
@@ -431,12 +505,91 @@ mod tests {
         assert!(!domain_matches("notexample.com", "*.example.com"));
     }
 
+    // ── resolve: port filtering ───────────────────────────────────────
+
+    #[test]
+    fn resolve_port_filter_matches() {
+        let hosts = vec![ResolvedHost {
+            host_pattern: "35.194.69.156".to_string(),
+            ports: vec![443],
+            ca_certs: vec![],
+            injection_rules: vec![InjectionRule {
+                path_pattern: "*".to_string(),
+                injections: vec![Injection::SetHeader {
+                    name: "authorization".to_string(),
+                    value: "Bearer tok".to_string(),
+                }],
+            }],
+        }];
+        let r = resolve("35.194.69.156:443", &hosts);
+        assert!(r.intercept);
+        assert_eq!(r.injection_rules.len(), 1);
+    }
+
+    #[test]
+    fn resolve_port_filter_rejects() {
+        let hosts = vec![ResolvedHost {
+            host_pattern: "35.194.69.156".to_string(),
+            ports: vec![443],
+            ca_certs: vec![],
+            injection_rules: vec![InjectionRule {
+                path_pattern: "*".to_string(),
+                injections: vec![Injection::SetHeader {
+                    name: "authorization".to_string(),
+                    value: "Bearer tok".to_string(),
+                }],
+            }],
+        }];
+        let r = resolve("35.194.69.156:8443", &hosts);
+        assert!(!r.intercept);
+        assert!(r.injection_rules.is_empty());
+    }
+
+    #[test]
+    fn resolve_no_ports_matches_any() {
+        let hosts = vec![ResolvedHost {
+            host_pattern: "api.example.com".to_string(),
+            ports: vec![],
+            ca_certs: vec![],
+            injection_rules: vec![InjectionRule {
+                path_pattern: "*".to_string(),
+                injections: vec![Injection::SetHeader {
+                    name: "x-api-key".to_string(),
+                    value: "sk-123".to_string(),
+                }],
+            }],
+        }];
+        assert!(resolve("api.example.com:443", &hosts).intercept);
+        assert!(resolve("api.example.com:8443", &hosts).intercept);
+    }
+
+    #[test]
+    fn resolve_multiple_ports() {
+        let hosts = vec![ResolvedHost {
+            host_pattern: "35.194.69.156".to_string(),
+            ports: vec![443, 8443],
+            ca_certs: vec![],
+            injection_rules: vec![InjectionRule {
+                path_pattern: "*".to_string(),
+                injections: vec![Injection::SetHeader {
+                    name: "authorization".to_string(),
+                    value: "Bearer tok".to_string(),
+                }],
+            }],
+        }];
+        assert!(resolve("35.194.69.156:443", &hosts).intercept);
+        assert!(resolve("35.194.69.156:8443", &hosts).intercept);
+        assert!(!resolve("35.194.69.156:9999", &hosts).intercept);
+    }
+
     // ── resolve ─────────────────────────────────────────────────────────
 
     #[test]
     fn resolve_no_match_returns_tunnel() {
         let hosts = vec![ResolvedHost {
             host_pattern: "api.anthropic.com".to_string(),
+            ports: vec![],
+            ca_certs: vec![],
             injection_rules: vec![InjectionRule {
                 path_pattern: "*".to_string(),
                 injections: vec![Injection::SetHeader {
@@ -445,15 +598,17 @@ mod tests {
                 }],
             }],
         }];
-        let (intercept, matched) = resolve("other.com", &hosts);
-        assert!(!intercept);
-        assert!(matched.is_empty());
+        let r = resolve("other.com:443", &hosts);
+        assert!(!r.intercept);
+        assert!(r.injection_rules.is_empty());
     }
 
     #[test]
     fn resolve_match_returns_rules() {
         let hosts = vec![ResolvedHost {
             host_pattern: "api.anthropic.com".to_string(),
+            ports: vec![],
+            ca_certs: vec![],
             injection_rules: vec![InjectionRule {
                 path_pattern: "*".to_string(),
                 injections: vec![Injection::SetHeader {
@@ -462,9 +617,9 @@ mod tests {
                 }],
             }],
         }];
-        let (intercept, matched) = resolve("api.anthropic.com", &hosts);
-        assert!(intercept);
-        assert_eq!(matched.len(), 1);
+        let r = resolve("api.anthropic.com:443", &hosts);
+        assert!(r.intercept);
+        assert_eq!(r.injection_rules.len(), 1);
     }
 
     // ── load: inline form ──────────────────────────────────────────────
@@ -745,6 +900,47 @@ header = "Authorization"
         }
     }
 
+    // ── load: ports ────────────────────────────────────────────────────
+
+    #[test]
+    fn load_ports_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "35.194.69.156"
+ports = [443]
+header = "authorization"
+value = "Bearer tok"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert_eq!(hosts[0].ports, vec![443]);
+    }
+
+    #[test]
+    fn load_no_ports_field_defaults_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "api.example.com"
+header = "x-api-key"
+value = "sk-123"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert!(hosts[0].ports.is_empty());
+    }
+
     // ── load: misc ─────────────────────────────────────────────────────
 
     #[test]
@@ -908,5 +1104,111 @@ source-path = "account.secret"
             }
             other => panic!("expected SetHeader, got {:?}", other),
         }
+    }
+
+    // ── split_host_port ────────────────────────────────────────────────
+
+    #[test]
+    fn split_host_port_basic() {
+        assert_eq!(split_host_port("example.com:443"), ("example.com", Some(443)));
+        assert_eq!(split_host_port("example.com:8443"), ("example.com", Some(8443)));
+    }
+
+    #[test]
+    fn split_host_port_no_port() {
+        assert_eq!(split_host_port("example.com"), ("example.com", None));
+    }
+
+    #[test]
+    fn split_host_port_ipv6() {
+        assert_eq!(split_host_port("[::1]:443"), ("::1", Some(443)));
+        assert_eq!(split_host_port("[2001:db8::1]:8080"), ("2001:db8::1", Some(8080)));
+    }
+
+    #[test]
+    fn split_host_port_ipv6_no_port() {
+        assert_eq!(split_host_port("[::1]"), ("::1", None));
+    }
+
+    // ── load: ca-cert ──────────────────────────────────────────────────
+
+    fn generate_ca_pem() -> String {
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+        cert.pem()
+    }
+
+    #[test]
+    fn load_ca_cert_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("custom-ca.pem");
+        std::fs::write(&cert_path, generate_ca_pem()).unwrap();
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "35.194.69.156"
+ports = [443]
+ca-cert = "{}"
+header = "authorization"
+value = "Bearer tok"
+"#,
+                cert_path.display()
+            ),
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert_eq!(hosts[0].ca_certs.len(), 1);
+        assert_eq!(hosts[0].ports, vec![443]);
+    }
+
+    #[test]
+    fn load_ca_cert_invalid_pem_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("bad.pem");
+        std::fs::write(&cert_path, "not a certificate").unwrap();
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "example.com"
+ca-cert = "{}"
+header = "x-api-key"
+value = "sk-123"
+"#,
+                cert_path.display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(format!("{err:?}").contains("no certificates found"));
+    }
+
+    #[test]
+    fn load_no_ca_cert_default_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "api.example.com"
+header = "x-api-key"
+value = "sk-123"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert!(hosts[0].ca_certs.is_empty());
     }
 }

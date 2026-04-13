@@ -153,6 +153,23 @@ fn build_upstream_tls_config(danger_accept_invalid_certs: bool) -> rustls::Clien
     }
 }
 
+/// Build an upstream TLS connector that trusts the given CA certs
+/// in addition to the default webpki roots.
+fn build_upstream_tls_with_certs(
+    extra_certs: &[rustls::pki_types::CertificateDer<'static>],
+) -> TlsConnector {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for cert in extra_certs {
+        // Validated at config load time, so this cannot fail.
+        let _ = root_store.add(cert.clone());
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
+}
+
 #[derive(Debug)]
 struct NoVerifier;
 
@@ -252,9 +269,9 @@ async fn handle_connect(
 
     let hostname = strip_port(&host).to_string();
 
-    let (intercept, injection_rules) = {
+    let resolved = {
         let rules = rules.read().unwrap();
-        crate::local::resolve(&hostname, &rules)
+        crate::local::resolve(&host, &rules)
     };
 
     let via_proxy = upstream_proxy
@@ -266,23 +283,28 @@ async fn handle_connect(
     info!(
         peer = %peer_addr,
         host = %host,
-        mode = if intercept { "mitm" } else { "tunnel" },
+        mode = if resolved.intercept { "mitm" } else { "tunnel" },
         upstream = if via_proxy { "proxy" } else { "direct" },
-        rule_count = injection_rules.len(),
+        rule_count = resolved.injection_rules.len(),
         "CONNECT"
     );
 
     tokio::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
-                let result = if intercept {
+                let result = if resolved.intercept {
+                    let tls = if resolved.ca_certs.is_empty() {
+                        upstream_tls
+                    } else {
+                        Arc::new(build_upstream_tls_with_certs(&resolved.ca_certs))
+                    };
                     mitm(
                         upgraded,
                         &host,
                         &ca,
-                        upstream_tls,
+                        tls,
                         upstream_proxy.as_ref().as_ref(),
-                        injection_rules,
+                        resolved.injection_rules,
                     )
                     .await
                 } else {

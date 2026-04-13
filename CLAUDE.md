@@ -52,5 +52,6 @@ Value sources: `source` (from file), `value` (inline literal), `source-path` (ex
 Source path resolution: bare names → `<config_dir>/secrets/<name>`, `~/...` → home-relative, `/...` → absolute
 Actions: `header`, `query-param`, `remove-header`
 Formatting: `format` (`{}` substitution)
-Filtering: `url-path` (default `*`)
+Filtering: `url-path` (default `*`), `ports` (array of u16, default all)
+TLS: `ca-cert` (PEM file path, added to default roots for upstream connections to this host)
 Secret files must be chmod 600 (no group/world access) or crinj refuses to start.
