@@ -153,23 +153,6 @@ fn build_upstream_tls_config(danger_accept_invalid_certs: bool) -> rustls::Clien
     }
 }
 
-/// Build an upstream TLS connector that trusts the given CA certs
-/// in addition to the default webpki roots.
-fn build_upstream_tls_with_certs(
-    extra_certs: &[rustls::pki_types::CertificateDer<'static>],
-) -> TlsConnector {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    for cert in extra_certs {
-        // Validated at config load time, so this cannot fail.
-        let _ = root_store.add(cert.clone());
-    }
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    TlsConnector::from(Arc::new(config))
-}
-
 #[derive(Debug)]
 struct NoVerifier;
 
@@ -293,16 +276,11 @@ async fn handle_connect(
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 let result = if resolved.intercept {
-                    let tls = if resolved.ca_certs.is_empty() {
-                        upstream_tls
-                    } else {
-                        Arc::new(build_upstream_tls_with_certs(&resolved.ca_certs))
-                    };
                     mitm(
                         upgraded,
                         &host,
                         &ca,
-                        tls,
+                        upstream_tls,
                         upstream_proxy.as_ref().as_ref(),
                         resolved.injection_rules,
                     )
