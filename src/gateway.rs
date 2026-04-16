@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use http_body_util::Empty;
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::HeaderName;
 use hyper::server::conn::http1;
@@ -18,8 +18,13 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{info, warn};
 
 use crate::ca::CertificateAuthority;
-use crate::inject::{self, InjectionRule};
+use crate::inject::{self, AccessEntry, AccessVerb, InjectionRule};
 use crate::local::ResolvedHost;
+
+/// Body type for responses emitted by the MITM service. Either the upstream
+/// response body (for forwarded requests) or a locally-synthesized body (for
+/// access-blocked requests).
+type ServiceBody = BoxBody<Bytes, hyper::Error>;
 
 // ── GatewayServer ───────────────────────────────────────────────────────
 
@@ -295,6 +300,7 @@ async fn handle_connect(
                         &ca,
                         upstream_tls,
                         upstream_proxy.as_ref().as_ref(),
+                        resolved.access,
                         resolved.injection_rules,
                     )
                     .await
@@ -322,6 +328,7 @@ async fn mitm(
     ca: &CertificateAuthority,
     upstream_tls: Arc<TlsConnector>,
     upstream_proxy: Option<&UpstreamProxy>,
+    access: Vec<AccessEntry>,
     injection_rules: Vec<InjectionRule>,
 ) -> Result<()> {
     let hostname = strip_port(host);
@@ -363,6 +370,7 @@ async fn mitm(
     });
 
     let host_owned = host.to_string();
+    let access = Arc::new(access);
     let injection_rules = Arc::new(injection_rules);
     let sender = Arc::new(tokio::sync::Mutex::new(sender));
     let io = TokioIo::new(tls_stream);
@@ -375,8 +383,9 @@ async fn mitm(
             service_fn(move |req| {
                 let host = host_owned.clone();
                 let sender = Arc::clone(&sender);
+                let access = Arc::clone(&access);
                 let inj_rules = Arc::clone(&injection_rules);
-                async move { forward_request(req, &host, &sender, &inj_rules).await }
+                async move { forward_request(req, &host, &sender, &access, &inj_rules).await }
             }),
         )
         .await
@@ -387,14 +396,27 @@ async fn forward_request(
     req: Request<Incoming>,
     host: &str,
     sender: &tokio::sync::Mutex<hyper::client::conn::http1::SendRequest<Incoming>>,
+    access: &[AccessEntry],
     injection_rules: &[InjectionRule],
-) -> anyhow::Result<Response<Incoming>> {
+) -> anyhow::Result<Response<ServiceBody>> {
     let method = req.method().clone();
     let raw_path = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
+
+    // Access control evaluated against the path before any query-param mutation.
+    let path_only = raw_path.split('?').next().unwrap_or(&raw_path);
+    if let Some(AccessVerb::Block) = inject::evaluate_access(path_only, access) {
+        info!(
+            method = %method,
+            url = format!("https://{host}{raw_path}"),
+            status = 200,
+            "blocked"
+        );
+        return Ok(blocked_response());
+    }
 
     let (path, query_injection_count) =
         inject::apply_query_injections(&raw_path, injection_rules);
@@ -434,11 +456,25 @@ async fn forward_request(
 
     // Strip hop-by-hop headers from response.
     let (resp_parts, body) = resp.into_parts();
-    let mut response = Response::new(body);
+    let mut response = Response::new(body.boxed());
     *response.status_mut() = resp_parts.status;
     *response.headers_mut() = filter_headers(&resp_parts.headers);
 
     Ok(response)
+}
+
+/// Synthetic response returned when access control blocks a request.
+/// 200 OK with empty JSON body — appears as a benign empty response to the caller.
+fn blocked_response() -> Response<ServiceBody> {
+    let body = Full::new(Bytes::from_static(b"{}"))
+        .map_err(|never| match never {})
+        .boxed();
+    let mut resp = Response::new(body);
+    resp.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    resp
 }
 
 async fn tunnel(

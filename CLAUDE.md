@@ -26,34 +26,48 @@ flake.nix      # Nix build + NixOS module
 
 ## Config format
 
+See SPEC.md for the full language. Quick reference:
+
 ```toml
-# Inline single rule (most common) — bare source name resolves to secrets/ dir
+# Single-inject host
 [[host]]
 domain = "api.example.com"
+[[host.inject]]
 source = "api-key"
-header = "authorization"
+header = "Authorization"
 format = "Bearer {}"
 
-# Multiple rules from one source file (absolute/~ paths also work)
+# Multi-inject host with shared source + access control
 [[host]]
-domain = "api.example.com"
+domain = "api.anthropic.com"
+access = """
+block *
+allow /v1/*
+"""
 source = "~/.config/example/creds.toml"
-[[host.rule]]
+[[host.inject]]
 source-path = "account.token_id"
 header = "x-token-id"
-[[host.rule]]
+[[host.inject]]
 source-path = "account.token_secret"
 header = "x-token-secret"
+
+# Block all subdomains matching a glob
+[[host]]
+domain = "http-intake.logs*.datadoghq.com"
+access = "block *"
 ```
 
-All injections require placeholders: the header or query param must already exist in the request.
+All header and query-param injections require placeholders: the field must already exist in the request.
 
-Canonical field order:
-- Matching: `domain`, `url-path` (default `*`), `ports` (array of u16, default all)
-- TLS: `no-check-certificate` (bool, default false) skips upstream cert verification per host
-- Source: `source` (from file), `source-path` (extract from JSON/TOML file), `value` (inline literal)
-- Action: `header`, `query-param`, `remove-header`
-- Modifiers: `format` (`{}` substitution)
+Canonical field order — host: `domain`, `no-check-certificate`, `access`, `source`, `inject`.
+Canonical field order — inject: `url-path`, `ports`, `source`, `source-path`, `value`, `header`/`query-param`/`remove-header`, `format`.
 
-Source path resolution: bare names → `<config_dir>/secrets/<name>`, `~/...` → home-relative, `/...` → absolute
+Host selection is most-specific-wins (fewer `*` then longer literal portion). Tie = config error.
+Access control is last-match-wins with natural-order enforcement (broader before narrower).
+Inject entries are cumulative across all matching entries.
+
+Glob patterns: `*` matches any sequence of characters (including dots), literal elsewhere.
+
+Source path resolution: bare names → `<config_dir>/secrets/<name>`, `~/...` → home-relative, `/...` → absolute.
 Secret files must be chmod 600 (no group/world access) or crinj refuses to start.

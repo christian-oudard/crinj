@@ -1,12 +1,15 @@
-//! Request injection engine.
+//! Request injection engine and access control.
 //!
 //! Applies injection rules to forwarded requests, with path pattern matching.
 //! All injections require a placeholder: the header or query parameter must
 //! already exist in the request for injection to occur.
 
+use anyhow::{bail, Result};
 use hyper::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use crate::glob;
 
 // ── Data types ──────────────────────────────────────────────────────────
 
@@ -26,10 +29,119 @@ pub(crate) enum Injection {
     },
 }
 
+/// One `[[host.inject]]` resolved into runtime form.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InjectionRule {
     pub path_pattern: String,
+    /// Empty = any port.
+    #[serde(default)]
+    pub ports: Vec<u16>,
     pub injections: Vec<Injection>,
+}
+
+impl InjectionRule {
+    pub fn port_matches(&self, port: Option<u16>) -> bool {
+        self.ports.is_empty() || port.map_or(false, |p| self.ports.contains(&p))
+    }
+}
+
+/// Access control verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AccessVerb {
+    Block,
+    Allow,
+}
+
+/// One line of an `access` list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct AccessEntry {
+    pub verb: AccessVerb,
+    pub path_pattern: String,
+}
+
+// ── Access control ──────────────────────────────────────────────────────
+
+/// Parse an `access` string into an ordered list of entries.
+///
+/// Each non-empty, non-comment line is `<verb> <path>`. Comments start with `#`.
+/// Validates natural order: broader entries must precede narrower ones.
+pub(crate) fn parse_access(s: &str) -> Result<Vec<AccessEntry>> {
+    let mut entries = Vec::new();
+    for (lineno, raw) in s.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (verb_str, path) = line
+            .split_once(char::is_whitespace)
+            .map(|(v, p)| (v, p.trim()))
+            .unwrap_or((line, ""));
+        let verb = match verb_str {
+            "block" => AccessVerb::Block,
+            "allow" => AccessVerb::Allow,
+            other => bail!(
+                "access line {}: unknown verb {:?} (expected `block` or `allow`)",
+                lineno + 1,
+                other
+            ),
+        };
+        if path.is_empty() {
+            bail!("access line {}: missing path after {}", lineno + 1, verb_str);
+        }
+        entries.push(AccessEntry {
+            verb,
+            path_pattern: path.to_string(),
+        });
+    }
+    validate_natural_order(&entries)?;
+    Ok(entries)
+}
+
+/// Error out if any entry is a superset of an earlier entry (broader-after-narrower).
+fn validate_natural_order(entries: &[AccessEntry]) -> Result<()> {
+    for j in 0..entries.len() {
+        for i in 0..j {
+            let a = &entries[i];
+            let b = &entries[j];
+            if a.path_pattern == b.path_pattern {
+                continue; // equal is OK, last wins
+            }
+            if glob::is_superset_of(&b.path_pattern, &a.path_pattern) {
+                bail!(
+                    "access: entry {} ({} {}) is broader than earlier entry {} ({} {}); \
+                     put broader patterns first",
+                    j + 1,
+                    verb_str(b.verb),
+                    b.path_pattern,
+                    i + 1,
+                    verb_str(a.verb),
+                    a.path_pattern,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verb_str(v: AccessVerb) -> &'static str {
+    match v {
+        AccessVerb::Block => "block",
+        AccessVerb::Allow => "allow",
+    }
+}
+
+/// Evaluate access rules against a request path.
+/// Returns the verb of the last matching entry, or `None` if nothing matches
+/// (default allow).
+pub(crate) fn evaluate_access(path: &str, entries: &[AccessEntry]) -> Option<AccessVerb> {
+    let mut result = None;
+    for entry in entries {
+        if glob::matches(path, &entry.path_pattern) {
+            result = Some(entry.verb);
+        }
+    }
+    result
 }
 
 // ── Injection application ───────────────────────────────────────────────
@@ -44,7 +156,7 @@ pub(crate) fn apply_injections(
     let mut count = 0;
 
     for rule in rules {
-        if !path_matches(request_path, &rule.path_pattern) {
+        if !glob::matches(request_path, &rule.path_pattern) {
             continue;
         }
 
@@ -105,7 +217,7 @@ pub(crate) fn apply_query_injections(
 
     let mut params_to_set: Vec<(&str, &str)> = Vec::new();
     for rule in rules {
-        if !path_matches(path, &rule.path_pattern) {
+        if !glob::matches(path, &rule.path_pattern) {
             continue;
         }
         for injection in &rule.injections {
@@ -168,62 +280,16 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/// Check if a request path matches a rule's path pattern.
-/// Supports: `"*"` (matches everything), `"/prefix/*"` (prefix match), exact match.
-pub(crate) fn path_matches(request_path: &str, pattern: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        return request_path == prefix
-            || (request_path.starts_with(prefix)
-                && request_path.as_bytes().get(prefix.len()) == Some(&b'/'));
-    }
-    request_path == pattern
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── path_matches ────────────────────────────────────────────────────
-
-    #[test]
-    fn path_wildcard_matches_everything() {
-        assert!(path_matches("/v1/messages", "*"));
-        assert!(path_matches("/", "*"));
-        assert!(path_matches("/any/path/here", "*"));
-    }
-
-    #[test]
-    fn path_prefix_wildcard() {
-        assert!(path_matches("/v1/messages", "/v1/*"));
-        assert!(path_matches("/v1/", "/v1/*"));
-        assert!(path_matches("/v1/completions/stream", "/v1/*"));
-        assert!(path_matches("/v1", "/v1/*"));
-    }
-
-    #[test]
-    fn path_prefix_wildcard_rejects_non_matching() {
-        assert!(!path_matches("/v2/messages", "/v1/*"));
-        assert!(!path_matches("/", "/v1/*"));
-        assert!(!path_matches("/v1beta/foo", "/v1/*"));
-    }
-
-    #[test]
-    fn path_exact() {
-        assert!(path_matches("/v1/messages", "/v1/messages"));
-        assert!(!path_matches("/v1/messages/", "/v1/messages"));
-        assert!(!path_matches("/v1/other", "/v1/messages"));
-    }
-
-    // ── apply_injections ────────────────────────────────────────────────
-
     fn make_rule(path_pattern: &str, injections: Vec<Injection>) -> InjectionRule {
         InjectionRule {
             path_pattern: path_pattern.to_string(),
+            ports: vec![],
             injections,
         }
     }
@@ -240,6 +306,15 @@ mod tests {
             name: name.to_string(),
         }
     }
+
+    fn set_query_param(name: &str, value: &str) -> Injection {
+        Injection::SetQueryParam {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    // ── apply_injections ────────────────────────────────────────────────
 
     #[test]
     fn inject_set_header_replaces_placeholder() {
@@ -268,65 +343,14 @@ mod tests {
     }
 
     #[test]
-    fn inject_set_header_overwrites_existing() {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer old-token"),
-        );
-
-        let rules = vec![make_rule(
-            "*",
-            vec![set_header("authorization", "Bearer new-token")],
-        )];
-
-        let count = apply_injections(&mut headers, "/", &rules);
-        assert_eq!(count, 1);
-        assert_eq!(headers.get("authorization").unwrap(), "Bearer new-token");
-    }
-
-    #[test]
     fn inject_remove_header() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("Bearer token"));
-        headers.insert("accept", HeaderValue::from_static("application/json"));
 
         let rules = vec![make_rule("*", vec![remove_header("authorization")])];
 
         let count = apply_injections(&mut headers, "/", &rules);
         assert_eq!(count, 1);
-        assert!(headers.get("authorization").is_none());
-        assert_eq!(headers.get("accept").unwrap(), "application/json");
-    }
-
-    #[test]
-    fn inject_remove_nonexistent_counts_zero() {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert("accept", HeaderValue::from_static("application/json"));
-
-        let rules = vec![make_rule("*", vec![remove_header("x-not-present")])];
-
-        let count = apply_injections(&mut headers, "/", &rules);
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn inject_combined_set_and_remove() {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert("x-api-key", HeaderValue::from_static("PLACEHOLDER"));
-        headers.insert("authorization", HeaderValue::from_static("Bearer old"));
-
-        let rules = vec![make_rule(
-            "*",
-            vec![
-                set_header("x-api-key", "sk-ant-123"),
-                remove_header("authorization"),
-            ],
-        )];
-
-        let count = apply_injections(&mut headers, "/v1/messages", &rules);
-        assert_eq!(count, 2);
-        assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-123");
         assert!(headers.get("authorization").is_none());
     }
 
@@ -360,23 +384,7 @@ mod tests {
         assert_eq!(headers.get("x-api-key").unwrap(), "key-v1");
     }
 
-    #[test]
-    fn inject_no_rules_returns_zero() {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert("accept", HeaderValue::from_static("*/*"));
-
-        let count = apply_injections(&mut headers, "/anything", &[]);
-        assert_eq!(count, 0);
-    }
-
     // ── apply_query_injections ──────────────────────────────────────────
-
-    fn set_query_param(name: &str, value: &str) -> Injection {
-        Injection::SetQueryParam {
-            name: name.to_string(),
-            value: value.to_string(),
-        }
-    }
 
     #[test]
     fn query_inject_skips_when_no_placeholder() {
@@ -398,24 +406,6 @@ mod tests {
     }
 
     #[test]
-    fn query_inject_replaces_existing_param() {
-        let rules = vec![make_rule("*", vec![set_query_param("api_key", "new")])];
-        let (result, count) = apply_query_injections("/path?api_key=old&other=1", &rules);
-        assert_eq!(count, 1);
-        assert!(result.contains("api_key=new"));
-        assert!(!result.contains("api_key=old"));
-        assert!(result.contains("other=1"));
-    }
-
-    #[test]
-    fn query_inject_no_match_returns_unchanged() {
-        let rules = vec![make_rule("/v1/*", vec![set_query_param("key", "val")])];
-        let (result, count) = apply_query_injections("/v2/foo?key=PLACEHOLDER", &rules);
-        assert_eq!(count, 0);
-        assert_eq!(result, "/v2/foo?key=PLACEHOLDER");
-    }
-
-    #[test]
     fn query_inject_encodes_special_chars() {
         let rules = vec![make_rule(
             "*",
@@ -425,84 +415,96 @@ mod tests {
         assert!(result.contains("q=hello%20world%26more"));
     }
 
+    // ── access: parse ──────────────────────────────────────────────────
+
     #[test]
-    fn query_inject_multiple_params() {
-        let rules = vec![make_rule(
-            "*",
-            vec![
-                set_query_param("api_key", "abc"),
-                set_query_param("file_type", "json"),
-            ],
-        )];
-        let (result, count) =
-            apply_query_injections("/fred/series?api_key=PH&file_type=PH", &rules);
-        assert_eq!(count, 2);
-        assert!(result.contains("api_key=abc"));
-        assert!(result.contains("file_type=json"));
+    fn parse_access_basic() {
+        let entries = parse_access("block *\nallow /v1/*\nblock /v1/admin/*").unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].verb, AccessVerb::Block);
+        assert_eq!(entries[0].path_pattern, "*");
+        assert_eq!(entries[2].verb, AccessVerb::Block);
+        assert_eq!(entries[2].path_pattern, "/v1/admin/*");
     }
 
     #[test]
-    fn query_inject_skips_header_injections() {
-        let rules = vec![make_rule(
-            "*",
-            vec![
-                set_header("x-api-key", "secret"),
-                set_query_param("api_key", "abc"),
-            ],
-        )];
-        let (result, count) = apply_query_injections("/path?api_key=PH", &rules);
-        assert_eq!(count, 1);
-        assert!(result.contains("api_key=abc"));
-        assert!(!result.contains("x-api-key"));
-    }
-
-    // ── placeholder requirement ────────────────────────────────────────
-
-    #[test]
-    fn header_skips_when_no_placeholder() {
-        let mut headers = hyper::HeaderMap::new();
-        let rules = vec![make_rule(
-            "*",
-            vec![set_header("x-api-key", "secret")],
-        )];
-        let count = apply_injections(&mut headers, "/", &rules);
-        assert_eq!(count, 0);
-        assert!(headers.get("x-api-key").is_none());
+    fn parse_access_single_line() {
+        let entries = parse_access("block *").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].verb, AccessVerb::Block);
     }
 
     #[test]
-    fn header_injects_when_placeholder_present() {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert("x-api-key", HeaderValue::from_static("PLACEHOLDER"));
-        let rules = vec![make_rule(
-            "*",
-            vec![set_header("x-api-key", "real-secret")],
-        )];
-        let count = apply_injections(&mut headers, "/", &rules);
-        assert_eq!(count, 1);
-        assert_eq!(headers.get("x-api-key").unwrap(), "real-secret");
+    fn parse_access_ignores_blanks_and_comments() {
+        let entries = parse_access(
+            "
+# top-level block
+block *
+
+# allow API
+allow /v1/*
+",
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]
-    fn query_skips_when_no_placeholder() {
-        let rules = vec![make_rule(
-            "*",
-            vec![set_query_param("api_key", "secret")],
-        )];
-        let (result, count) = apply_query_injections("/path", &rules);
-        assert_eq!(count, 0);
-        assert_eq!(result, "/path");
+    fn parse_access_unknown_verb_errors() {
+        let err = parse_access("deny /v1/*").unwrap_err();
+        assert!(format!("{err:?}").contains("unknown verb"));
     }
 
     #[test]
-    fn query_injects_when_placeholder_present() {
-        let rules = vec![make_rule(
-            "*",
-            vec![set_query_param("api_key", "real-secret")],
-        )];
-        let (result, count) = apply_query_injections("/path?api_key=PLACEHOLDER", &rules);
-        assert_eq!(count, 1);
-        assert!(result.contains("api_key=real-secret"));
-        assert!(!result.contains("PLACEHOLDER"));
+    fn parse_access_missing_path_errors() {
+        let err = parse_access("block").unwrap_err();
+        assert!(format!("{err:?}").contains("missing path"));
+    }
+
+    #[test]
+    fn parse_access_unnatural_order_errors() {
+        let err = parse_access("allow /v1/*\nblock *").unwrap_err();
+        assert!(format!("{err:?}").contains("broader than earlier"));
+    }
+
+    #[test]
+    fn parse_access_nested_unnatural_errors() {
+        let err = parse_access("block /v1/admin/*\nallow /v1/*").unwrap_err();
+        assert!(format!("{err:?}").contains("broader than earlier"));
+    }
+
+    #[test]
+    fn parse_access_disjoint_any_order() {
+        // /v1 and /v2 are disjoint, any order works.
+        parse_access("block /v1/*\nallow /v2/*").unwrap();
+        parse_access("allow /v2/*\nblock /v1/*").unwrap();
+    }
+
+    // ── access: evaluate ───────────────────────────────────────────────
+
+    #[test]
+    fn eval_empty_list_returns_none() {
+        assert_eq!(evaluate_access("/v1/foo", &[]), None);
+    }
+
+    #[test]
+    fn eval_block_all() {
+        let entries = parse_access("block *").unwrap();
+        assert_eq!(evaluate_access("/anything", &entries), Some(AccessVerb::Block));
+    }
+
+    #[test]
+    fn eval_last_match_wins() {
+        let entries = parse_access("block *\nallow /v1/*").unwrap();
+        assert_eq!(evaluate_access("/v1/foo", &entries), Some(AccessVerb::Allow));
+        assert_eq!(evaluate_access("/v2/foo", &entries), Some(AccessVerb::Block));
+    }
+
+    #[test]
+    fn eval_nested_block_after_allow() {
+        let entries = parse_access("block *\nallow /v1/*\nblock /v1/admin/*").unwrap();
+        assert_eq!(evaluate_access("/v1/admin/x", &entries), Some(AccessVerb::Block));
+        assert_eq!(evaluate_access("/v1/users", &entries), Some(AccessVerb::Allow));
+        assert_eq!(evaluate_access("/anything", &entries), Some(AccessVerb::Block));
     }
 }

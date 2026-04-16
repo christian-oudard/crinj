@@ -36,54 +36,43 @@ Send `SIGHUP` to reload config without restarting.
 
 Host entries are defined in TOML. Each entry matches a domain and injects credentials into matching requests. All injections require a placeholder: the header or query parameter must already exist in the request. The agent sends a dummy value, and Crinj replaces it with the real credential.
 
-Most entries need a single rule, written inline:
+Every inject entry lives in its own `[[host.inject]]` sub-table:
 
 ```toml
 [[host]]
 domain = "huggingface.co"
+[[host.inject]]
 source = "~/.config/crinj/secrets/huggingface.key"
 header = "Authorization"
 format = "Bearer {}"
 
 [[host]]
 domain = "api.stlouisfed.org"
+[[host.inject]]
 source = "~/.config/crinj/secrets/fred.key"
 query-param = "api_key"
 
 [[host]]
 domain = "api.schwabapi.com"
+[[host.inject]]
 source = "~/.cache/rhs/schwab_token.json"
 source-path = "token.access_token"
 header = "Authorization"
 format = "Bearer {}"
 ```
 
-For multiple rules per host, use `[[host.rule]]` sub-tables (which inherit the host-level `source`):
+When multiple inject entries share a source file, lift `source` to the host level — entries inherit it:
 
 ```toml
 [[host]]
 domain = "api.modal.com"
 source = "~/.config/modal/modal.toml"
-[[host.rule]]
+[[host.inject]]
 source-path = "christian-oudard.token_id"
 header = "x-modal-token-id"
-[[host.rule]]
+[[host.inject]]
 source-path = "christian-oudard.token_secret"
 header = "x-modal-token-secret"
-```
-
-For other multi-rule cases:
-
-```toml
-[[host]]
-domain = "api.example.com"
-[[host.rule]]
-source = "~/.config/creds.toml"
-source-path = "account.token"
-header = "x-token"
-format = "Bearer {}"
-[[host.rule]]
-remove-header = "x-debug"
 ```
 
 ### Host fields
@@ -91,20 +80,23 @@ remove-header = "x-debug"
 | Field | Description |
 |---|---|
 | `domain` | Domain to match. Supports wildcards: `*.example.com` |
-| `source` | Default source file, inherited by rules |
+| `no-check-certificate` | Skip upstream TLS verification (bool, default false) |
+| `access` | Access control list (multiline string, `block`/`allow` lines) |
+| `source` | Default source file, inherited by inject entries |
 
-### Rule fields
+### Inject entry fields
 
 | Field | Description |
 |---|---|
+| `url-path` | URL path pattern. Default `*`. Supports wildcards: `/v1/*` |
+| `ports` | Port list (array of u16, default all) |
 | `source` | Read value from a file (trimmed). Overrides host-level source |
-| `value` | Inline literal value (alternative to source) |
 | `source-path` | Dot-notation path into a structured source file (auto-detects JSON/TOML). Numeric segments index arrays |
+| `value` | Inline literal value (alternative to source) |
 | `header` | Header to set |
 | `query-param` | Query parameter to set |
 | `remove-header` | Header to remove (no value needed) |
 | `format` | Format string, `{}` is replaced with the resolved value (e.g. `"Bearer {}"`) |
-| `url-path` | URL path pattern. Default `*`. Supports prefix wildcards: `/v1/*` |
 
 ## NixOS
 

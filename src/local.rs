@@ -1,15 +1,16 @@
-//! Standalone mode: load host config from a TOML file instead of the database.
+//! Load host config from a TOML file.
 //!
-//! In standalone mode the gateway reads host entries at startup, resolves `source`
-//! file references into in-memory strings, and matches incoming CONNECT hostnames against
-//! those entries. No database, auth tokens, or web API involved.
+//! Parses the file at startup, resolves `source` references into in-memory
+//! strings, validates access-control natural order, and produces `ResolvedHost`
+//! values used by the runtime.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::inject::{Injection, InjectionRule};
+use crate::glob;
+use crate::inject::{self, AccessEntry, Injection, InjectionRule};
 
 // ── TOML schema ─────────────────────────────────────────────────────────
 
@@ -20,99 +21,61 @@ struct Config {
     host: Vec<HostEntry>,
 }
 
-/// A single host entry in the TOML file.
+/// A single `[[host]]` entry.
 ///
-/// Two forms, mutually exclusive:
-///
-/// 1. Inline (single rule, most common):
-/// ```toml
-/// [[host]]
-/// domain = "api.example.com"
-/// source = "~/.secrets/key"
-/// header = "authorization"
-/// format = "Bearer {}"
-/// ```
-///
-/// 2. Rule sub-tables (multiple rules, each with optional url-path):
-/// ```toml
-/// [[host]]
-/// domain = "api.example.com"
-/// source = "~/.config/creds.toml"
-/// [[host.rule]]
-/// source-path = "account.token_id"
-/// header = "x-token-id"
-/// [[host.rule]]
-/// source-path = "account.token_secret"
-/// header = "x-token-secret"
-/// ```
-///
-/// Canonical field order: matching (domain, url-path, ports),
-/// TLS (no-check-certificate), source (source, source-path, value),
-/// action (header, query-param, remove-header), modifiers (format).
+/// Canonical field order:
+/// 1. `domain` — match pattern
+/// 2. `no-check-certificate` — TLS (bool, default false)
+/// 3. `access` — multiline access-control list (optional)
+/// 4. `source` — host-level default source, inherited by inject entries (optional)
+/// 5. `inject` — list of `[[host.inject]]`
 #[derive(Deserialize)]
 struct HostEntry {
     domain: String,
-    /// Optional port filter. If omitted, matches any port.
-    #[serde(default)]
-    ports: Vec<u16>,
-    /// Skip upstream TLS certificate verification for this host.
     #[serde(default, rename = "no-check-certificate")]
     no_check_certificate: bool,
-    /// Default source file (inherited by rule entries).
+    #[serde(default)]
+    access: Option<String>,
     #[serde(default)]
     source: Option<String>,
-    /// Multi-rule sub-tables.
     #[serde(default)]
-    rule: Vec<RuleEntry>,
-    /// Inline rule fields (flattened into the host entry).
-    #[serde(flatten)]
-    inline: RuleEntry,
+    inject: Vec<InjectEntry>,
 }
 
 fn default_path() -> String {
     "*".to_string()
 }
 
-/// Rule fields shared by both inline and sub-table forms.
-/// Exactly one of `header`, `query_param`, or `remove_header` must be set.
+/// A single `[[host.inject]]` entry.
+///
+/// Canonical field order:
+/// 1. `url-path` — path match (default `*`)
+/// 2. `ports` — port filter (default all)
+/// 3. `source` — credential source file
+/// 4. `source-path` — structured lookup inside source
+/// 5. `value` — inline literal (alternative to source)
+/// 6. `header` / `query-param` / `remove-header` — action (exactly one)
+/// 7. `format` — format string (`{}` substitution)
 #[derive(Deserialize, Default)]
-struct RuleEntry {
-    // Matching
-    /// URL path pattern. Default `*`. Supports `/v1/*` prefix wildcards.
+struct InjectEntry {
     #[serde(default = "default_path", rename = "url-path")]
     url_path: String,
-    // Source
-    /// Path to a file containing the value (read at startup).
+    #[serde(default)]
+    ports: Vec<u16>,
     #[serde(default)]
     source: Option<String>,
-    /// Dot-notation path into a structured `source` file.
-    /// Segments are keys or array indices. Format auto-detected from extension.
     #[serde(default, rename = "source-path")]
     source_path: Option<String>,
-    /// Inline literal value.
     #[serde(default)]
     value: Option<String>,
-    // Action
-    /// Header name (implies set_header action).
     #[serde(default)]
     header: Option<String>,
-    /// Query parameter name (implies set_query_param action).
     #[serde(default, rename = "query-param")]
     query_param: Option<String>,
-    /// Header name to remove (implies remove_header action).
     #[serde(default, rename = "remove-header")]
     remove_header: Option<String>,
-    // Modifiers
-    /// Optional format string. `{}` is replaced with the resolved value.
     #[serde(default)]
     format: Option<String>,
-}
-
-impl RuleEntry {
-    /// True if this entry specifies an action (header, query-param, or remove-header).
-    fn has_action(&self) -> bool {
-        self.header.is_some() || self.query_param.is_some() || self.remove_header.is_some()
-    }
 }
 
 // ── Resolved types ──────────────────────────────────────────────────────
@@ -121,17 +84,9 @@ impl RuleEntry {
 #[derive(Debug)]
 pub(crate) struct ResolvedHost {
     pub host_pattern: String,
-    /// Empty = match any port.
-    pub ports: Vec<u16>,
-    /// Skip upstream TLS certificate verification for this host.
     pub no_check_certificate: bool,
+    pub access: Vec<AccessEntry>,
     pub injection_rules: Vec<InjectionRule>,
-}
-
-impl ResolvedHost {
-    fn port_matches(&self, port: Option<u16>) -> bool {
-        self.ports.is_empty() || port.map_or(false, |p| self.ports.contains(&p))
-    }
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────
@@ -145,89 +100,91 @@ pub(crate) fn load(path: &Path) -> Result<Vec<ResolvedHost>> {
 
     let mut resolved = Vec::with_capacity(config.host.len());
     for entry in config.host {
-        let injection_rules = resolve_host_rules(&entry, path)?;
+        let access = match &entry.access {
+            Some(s) => inject::parse_access(s).with_context(|| {
+                format!("host {:?} in {}", entry.domain, path.display())
+            })?,
+            None => Vec::new(),
+        };
+        let injection_rules = resolve_host_injects(&entry, path)?;
         resolved.push(ResolvedHost {
             host_pattern: entry.domain,
-            ports: entry.ports,
             no_check_certificate: entry.no_check_certificate,
+            access,
             injection_rules,
         });
     }
+    validate_host_specificity(&resolved)?;
     Ok(resolved)
 }
 
-/// Resolve rules for a host entry, handling inline and sub-table forms.
-fn resolve_host_rules(entry: &HostEntry, config_path: &Path) -> Result<Vec<InjectionRule>> {
-    let has_inline = entry.inline.has_action();
-    let has_rules = !entry.rule.is_empty();
-
-    if has_inline && has_rules {
-        bail!(
-            "host {:?} in {}: use either inline fields or [[host.rule]], not both",
-            entry.domain,
-            config_path.display()
-        );
+/// Error out if two host entries have equal specificity (duplicate domains).
+fn validate_host_specificity(hosts: &[ResolvedHost]) -> Result<()> {
+    for i in 0..hosts.len() {
+        for j in (i + 1)..hosts.len() {
+            if hosts[i].host_pattern == hosts[j].host_pattern {
+                bail!(
+                    "duplicate host domain {:?} (entries {} and {})",
+                    hosts[i].host_pattern,
+                    i + 1,
+                    j + 1
+                );
+            }
+        }
     }
+    Ok(())
+}
 
-    // Host-level source, used as fallback for inline/rules.
-    // For inline, serde(flatten) means source is consumed by the host-level field,
-    // so the inline RuleEntry always has source = None.
+/// Build injection rules from a host entry's `[[host.inject]]` list.
+fn resolve_host_injects(entry: &HostEntry, config_path: &Path) -> Result<Vec<InjectionRule>> {
     let fallback_source = entry.source.as_deref();
     let domain = &entry.domain;
 
-    if has_inline {
-        let injection =
-            resolve_injection(&entry.inline, fallback_source, domain, config_path)?;
-        return Ok(vec![InjectionRule {
-            path_pattern: entry.inline.url_path.clone(),
-            injections: vec![injection],
-        }]);
-    }
-
     entry
-        .rule
+        .inject
         .iter()
-        .map(|rule| {
-            let injection = resolve_injection(rule, fallback_source, domain, config_path)?;
+        .map(|ie| {
+            let injection = resolve_injection(ie, fallback_source, domain, config_path)?;
             Ok(InjectionRule {
-                path_pattern: rule.url_path.clone(),
+                path_pattern: ie.url_path.clone(),
+                ports: ie.ports.clone(),
                 injections: vec![injection],
             })
         })
         .collect()
 }
 
-/// Resolve a single rule entry into an `Injection` value.
-/// `fallback_source` is the host-level `source`, used when the rule doesn't have one.
+/// Resolve a single inject entry into an `Injection` value.
+/// `fallback_source` is the host-level `source`, used when the entry doesn't have one.
 fn resolve_injection(
-    rule: &RuleEntry,
+    entry: &InjectEntry,
     fallback_source: Option<&str>,
     domain: &str,
     config_path: &Path,
 ) -> Result<Injection> {
-    if let Some(ref name) = rule.remove_header {
+    if let Some(ref name) = entry.remove_header {
         return Ok(Injection::RemoveHeader {
             name: name.clone(),
         });
     }
-    if let Some(ref name) = rule.header {
-        let raw = resolve_value(rule, fallback_source, domain, config_path)?;
-        let value = format_value(&raw, &rule.format);
+    if let Some(ref name) = entry.header {
+        let raw = resolve_value(entry, fallback_source, domain, config_path)?;
+        let value = format_value(&raw, &entry.format);
         return Ok(Injection::SetHeader {
             name: name.clone(),
             value,
         });
     }
-    if let Some(ref name) = rule.query_param {
-        let raw = resolve_value(rule, fallback_source, domain, config_path)?;
-        let value = format_value(&raw, &rule.format);
+    if let Some(ref name) = entry.query_param {
+        let raw = resolve_value(entry, fallback_source, domain, config_path)?;
+        let value = format_value(&raw, &entry.format);
         return Ok(Injection::SetQueryParam {
             name: name.clone(),
             value,
         });
     }
     bail!(
-        "rule for domain {:?} in {} must have `header`, `query-param`, or `remove-header`",
+        "inject entry for domain {:?} in {} must have `header`, `query-param`, or `remove-header`",
         domain,
         config_path.display()
     );
@@ -241,19 +198,19 @@ fn format_value(raw: &str, format: &Option<String>) -> String {
     }
 }
 
-/// Resolve the value for a rule: inline `value` or `source` file.
-/// Falls back to the host-level `source` if the rule doesn't specify one.
+/// Resolve the value for an inject entry: inline `value` or `source` file.
+/// Falls back to the host-level `source` if the entry doesn't specify one.
 fn resolve_value(
-    rule: &RuleEntry,
+    entry: &InjectEntry,
     fallback_source: Option<&str>,
     domain: &str,
     config_path: &Path,
 ) -> Result<String> {
-    if let Some(ref v) = rule.value {
+    if let Some(ref v) = entry.value {
         return Ok(v.clone());
     }
 
-    let source = rule.source.as_deref().or(fallback_source);
+    let source = entry.source.as_deref().or(fallback_source);
     if let Some(source) = source {
         let expanded = resolve_source_path(source, config_path);
         check_file_permissions(&expanded)?;
@@ -266,7 +223,7 @@ fn resolve_value(
             )
         })?;
 
-        if let Some(ref sp) = rule.source_path {
+        if let Some(ref sp) = entry.source_path {
             return extract_path(&content, sp, &expanded).with_context(|| {
                 format!(
                     "extracting source-path {:?} from {} (for domain {:?})",
@@ -280,7 +237,7 @@ fn resolve_value(
         return Ok(content.trim().to_string());
     }
     bail!(
-        "rule for domain {:?} in {} has neither `value` nor `source`",
+        "inject entry for domain {:?} in {} has neither `value` nor `source`",
         domain,
         config_path.display()
     );
@@ -363,25 +320,44 @@ fn extract_toml_path(content: &str, path: &str) -> Result<String> {
 pub(crate) struct ResolveResult {
     pub intercept: bool,
     pub no_check_certificate: bool,
+    pub access: Vec<AccessEntry>,
     pub injection_rules: Vec<InjectionRule>,
 }
 
-/// Find all host entries matching a hostname and port.
+/// Find the most-specific host entry matching the CONNECT authority, and
+/// return its access list plus port-filtered injection rules.
+///
 /// `host` is the raw CONNECT authority, e.g. `example.com:443`.
 pub(crate) fn resolve(host: &str, hosts: &[ResolvedHost]) -> ResolveResult {
     let (hostname, port) = split_host_port(host);
-    let mut rules = Vec::new();
-    let mut no_check_certificate = false;
-    for h in hosts {
-        if domain_matches(hostname, &h.host_pattern) && h.port_matches(port) {
-            rules.extend(h.injection_rules.iter().cloned());
-            no_check_certificate = no_check_certificate || h.no_check_certificate;
+
+    // Find all matching hosts and pick the most specific.
+    let best = hosts
+        .iter()
+        .filter(|h| glob::matches(hostname, &h.host_pattern))
+        .max_by_key(|h| glob::specificity(&h.host_pattern));
+
+    match best {
+        Some(h) => {
+            let injection_rules: Vec<InjectionRule> = h
+                .injection_rules
+                .iter()
+                .filter(|r| r.port_matches(port))
+                .cloned()
+                .collect();
+            ResolveResult {
+                intercept: true,
+                no_check_certificate: h.no_check_certificate,
+                access: h.access.clone(),
+                injection_rules,
+            }
         }
-    }
-    ResolveResult {
-        intercept: !rules.is_empty(),
-        no_check_certificate,
-        injection_rules: rules,
+        None => ResolveResult {
+            intercept: false,
+            no_check_certificate: false,
+            access: Vec::new(),
+            injection_rules: Vec::new(),
+        },
     }
 }
 
@@ -406,19 +382,6 @@ fn split_host_port(s: &str) -> (&str, Option<u16>) {
         }
     }
     (s, None)
-}
-
-/// Check if a hostname matches a domain pattern (`*.suffix` wildcard or exact).
-fn domain_matches(hostname: &str, pattern: &str) -> bool {
-    if pattern == hostname {
-        return true;
-    }
-    if let Some(suffix) = pattern.strip_prefix("*.") {
-        return hostname.ends_with(suffix)
-            && hostname.len() > suffix.len()
-            && hostname.as_bytes()[hostname.len() - suffix.len() - 1] == b'.';
-    }
-    false
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -451,6 +414,7 @@ fn resolve_source_path(source: &str, config_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inject::AccessVerb;
 
     /// Write a secret file with 0o600 permissions.
     fn write_secret(path: &Path, content: &str) {
@@ -462,156 +426,136 @@ mod tests {
         }
     }
 
-    // ── domain_matches ──────────────────────────────────────────────────
-
-    #[test]
-    fn domain_exact_match() {
-        assert!(domain_matches("api.anthropic.com", "api.anthropic.com"));
-        assert!(!domain_matches("api.anthropic.com", "other.com"));
-    }
-
-    #[test]
-    fn domain_wildcard_match() {
-        assert!(domain_matches("api.example.com", "*.example.com"));
-        assert!(domain_matches("sub.api.example.com", "*.example.com"));
-    }
-
-    #[test]
-    fn domain_wildcard_no_match_bare() {
-        assert!(!domain_matches("example.com", "*.example.com"));
-    }
-
-    #[test]
-    fn domain_wildcard_no_match_different() {
-        assert!(!domain_matches("api.other.com", "*.example.com"));
-    }
-
-    #[test]
-    fn domain_wildcard_no_partial_match() {
-        assert!(!domain_matches("notexample.com", "*.example.com"));
-    }
-
-    // ── resolve: port filtering ───────────────────────────────────────
-
-    #[test]
-    fn resolve_port_filter_matches() {
-        let hosts = vec![ResolvedHost {
-            host_pattern: "35.194.69.156".to_string(),
-            ports: vec![443],
+    fn host(pattern: &str) -> ResolvedHost {
+        ResolvedHost {
+            host_pattern: pattern.to_string(),
             no_check_certificate: false,
+            access: vec![],
             injection_rules: vec![InjectionRule {
                 path_pattern: "*".to_string(),
-                injections: vec![Injection::SetHeader {
-                    name: "authorization".to_string(),
-                    value: "Bearer tok".to_string(),
-                }],
-            }],
-        }];
-        let r = resolve("35.194.69.156:443", &hosts);
-        assert!(r.intercept);
-        assert_eq!(r.injection_rules.len(), 1);
-    }
-
-    #[test]
-    fn resolve_port_filter_rejects() {
-        let hosts = vec![ResolvedHost {
-            host_pattern: "35.194.69.156".to_string(),
-            ports: vec![443],
-            no_check_certificate: false,
-            injection_rules: vec![InjectionRule {
-                path_pattern: "*".to_string(),
-                injections: vec![Injection::SetHeader {
-                    name: "authorization".to_string(),
-                    value: "Bearer tok".to_string(),
-                }],
-            }],
-        }];
-        let r = resolve("35.194.69.156:8443", &hosts);
-        assert!(!r.intercept);
-        assert!(r.injection_rules.is_empty());
-    }
-
-    #[test]
-    fn resolve_no_ports_matches_any() {
-        let hosts = vec![ResolvedHost {
-            host_pattern: "api.example.com".to_string(),
-            ports: vec![],
-            no_check_certificate: false,
-            injection_rules: vec![InjectionRule {
-                path_pattern: "*".to_string(),
+                ports: vec![],
                 injections: vec![Injection::SetHeader {
                     name: "x-api-key".to_string(),
                     value: "sk-123".to_string(),
                 }],
             }],
-        }];
+        }
+    }
+
+    // ── resolve: domain matching ────────────────────────────────────────
+
+    #[test]
+    fn resolve_exact_domain() {
+        let hosts = vec![host("api.example.com")];
         assert!(resolve("api.example.com:443", &hosts).intercept);
-        assert!(resolve("api.example.com:8443", &hosts).intercept);
+        assert!(!resolve("other.com:443", &hosts).intercept);
     }
 
     #[test]
-    fn resolve_multiple_ports() {
-        let hosts = vec![ResolvedHost {
-            host_pattern: "35.194.69.156".to_string(),
-            ports: vec![443, 8443],
-            no_check_certificate: false,
-            injection_rules: vec![InjectionRule {
-                path_pattern: "*".to_string(),
-                injections: vec![Injection::SetHeader {
-                    name: "authorization".to_string(),
-                    value: "Bearer tok".to_string(),
-                }],
-            }],
-        }];
-        assert!(resolve("35.194.69.156:443", &hosts).intercept);
-        assert!(resolve("35.194.69.156:8443", &hosts).intercept);
-        assert!(!resolve("35.194.69.156:9999", &hosts).intercept);
-    }
-
-    // ── resolve ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn resolve_no_match_returns_tunnel() {
-        let hosts = vec![ResolvedHost {
-            host_pattern: "api.anthropic.com".to_string(),
-            ports: vec![],
-            no_check_certificate: false,
-            injection_rules: vec![InjectionRule {
-                path_pattern: "*".to_string(),
-                injections: vec![Injection::SetHeader {
-                    name: "x-api-key".to_string(),
-                    value: "sk-123".to_string(),
-                }],
-            }],
-        }];
-        let r = resolve("other.com:443", &hosts);
-        assert!(!r.intercept);
-        assert!(r.injection_rules.is_empty());
+    fn resolve_wildcard_domain() {
+        let hosts = vec![host("*.example.com")];
+        assert!(resolve("api.example.com:443", &hosts).intercept);
+        assert!(resolve("a.b.example.com:443", &hosts).intercept);
+        assert!(!resolve("example.com:443", &hosts).intercept);
     }
 
     #[test]
-    fn resolve_match_returns_rules() {
-        let hosts = vec![ResolvedHost {
-            host_pattern: "api.anthropic.com".to_string(),
-            ports: vec![],
-            no_check_certificate: false,
-            injection_rules: vec![InjectionRule {
-                path_pattern: "*".to_string(),
-                injections: vec![Injection::SetHeader {
-                    name: "x-api-key".to_string(),
-                    value: "sk-123".to_string(),
-                }],
-            }],
-        }];
-        let r = resolve("api.anthropic.com:443", &hosts);
+    fn resolve_middle_wildcard_domain() {
+        let hosts = vec![host("http-intake.logs*.datadoghq.com")];
+        assert!(resolve("http-intake.logs.datadoghq.com:443", &hosts).intercept);
+        assert!(resolve("http-intake.logs.us5.datadoghq.com:443", &hosts).intercept);
+        assert!(!resolve("api.datadoghq.com:443", &hosts).intercept);
+    }
+
+    #[test]
+    fn resolve_most_specific_wins() {
+        // Specific entry has different rule than wildcard; verify specific matches first.
+        let mut specific = host("api.datadoghq.com");
+        specific.injection_rules[0].injections[0] = Injection::SetHeader {
+            name: "x-api-key".to_string(),
+            value: "specific".to_string(),
+        };
+        let mut wildcard = host("*.datadoghq.com");
+        wildcard.access = inject::parse_access("block *").unwrap();
+        wildcard.injection_rules.clear();
+
+        let hosts = vec![wildcard, specific];
+        let r = resolve("api.datadoghq.com:443", &hosts);
         assert!(r.intercept);
+        assert!(r.access.is_empty(), "specific host has no access block");
         assert_eq!(r.injection_rules.len(), 1);
     }
 
-    // ── load: inline form ──────────────────────────────────────────────
+    #[test]
+    fn resolve_wildcard_wins_when_specific_doesnt_match() {
+        let mut specific = host("api.datadoghq.com");
+        specific.injection_rules[0].injections[0] = Injection::SetHeader {
+            name: "x-api-key".to_string(),
+            value: "specific".to_string(),
+        };
+        let mut wildcard = host("*.datadoghq.com");
+        wildcard.access = inject::parse_access("block *").unwrap();
+        wildcard.injection_rules.clear();
+
+        let hosts = vec![wildcard, specific];
+        let r = resolve("http-intake.logs.datadoghq.com:443", &hosts);
+        assert!(r.intercept);
+        assert_eq!(r.access.len(), 1);
+        assert_eq!(r.access[0].verb, AccessVerb::Block);
+    }
+
+    // ── resolve: port filtering (per rule) ─────────────────────────────
 
     #[test]
-    fn load_inline_header() {
+    fn resolve_rule_port_filter() {
+        let mut h = host("35.194.69.156");
+        h.injection_rules[0].ports = vec![8443];
+        let hosts = vec![h];
+        assert_eq!(resolve("35.194.69.156:8443", &hosts).injection_rules.len(), 1);
+        assert_eq!(resolve("35.194.69.156:443", &hosts).injection_rules.len(), 0);
+    }
+
+    #[test]
+    fn resolve_rule_no_port_matches_any() {
+        let h = host("api.example.com"); // default: ports = []
+        let hosts = vec![h];
+        assert_eq!(resolve("api.example.com:443", &hosts).injection_rules.len(), 1);
+        assert_eq!(resolve("api.example.com:8443", &hosts).injection_rules.len(), 1);
+    }
+
+    // ── resolve: access propagation ────────────────────────────────────
+
+    #[test]
+    fn resolve_propagates_access() {
+        let mut h = host("api.example.com");
+        h.access = inject::parse_access("block *\nallow /v1/*").unwrap();
+        let hosts = vec![h];
+        let r = resolve("api.example.com:443", &hosts);
+        assert_eq!(r.access.len(), 2);
+    }
+
+    #[test]
+    fn resolve_propagates_no_check_certificate() {
+        let mut h = host("10.0.0.1");
+        h.no_check_certificate = true;
+        let hosts = vec![h];
+        assert!(resolve("10.0.0.1:8443", &hosts).no_check_certificate);
+    }
+
+    // ── load: basic ────────────────────────────────────────────────────
+
+    #[test]
+    fn load_empty_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn load_single_rule_header() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("rules.toml");
         std::fs::write(
@@ -619,6 +563,7 @@ mod tests {
             r#"
 [[host]]
 domain = "api.anthropic.com"
+[[host.inject]]
 header = "x-api-key"
 value = "sk-inline-123"
 "#,
@@ -638,7 +583,7 @@ value = "sk-inline-123"
     }
 
     #[test]
-    fn load_inline_header_from_file() {
+    fn load_source_from_file() {
         let dir = tempfile::tempdir().unwrap();
         let secret_path = dir.path().join("secret.key");
         write_secret(&secret_path, "sk-from-file-456\n");
@@ -650,8 +595,9 @@ value = "sk-inline-123"
                 r#"
 [[host]]
 domain = "api.anthropic.com"
-header = "x-api-key"
+[[host.inject]]
 source = "{}"
+header = "x-api-key"
 "#,
                 secret_path.display()
             ),
@@ -666,7 +612,7 @@ source = "{}"
     }
 
     #[test]
-    fn load_inline_with_format() {
+    fn load_with_format() {
         let dir = tempfile::tempdir().unwrap();
         let secret_path = dir.path().join("token.key");
         write_secret(&secret_path, "hf_abc123\n");
@@ -678,8 +624,9 @@ source = "{}"
                 r#"
 [[host]]
 domain = "huggingface.co"
-header = "authorization"
+[[host.inject]]
 source = "{}"
+header = "authorization"
 format = "Bearer {{}}"
 "#,
                 secret_path.display()
@@ -695,7 +642,7 @@ format = "Bearer {{}}"
     }
 
     #[test]
-    fn load_inline_query_param() {
+    fn load_query_param() {
         let dir = tempfile::tempdir().unwrap();
         let secret = dir.path().join("fred.key");
         write_secret(&secret, "MY_API_KEY\n");
@@ -707,8 +654,9 @@ format = "Bearer {{}}"
                 r#"
 [[host]]
 domain = "api.stlouisfed.org"
-query-param = "api_key"
+[[host.inject]]
 source = "{}"
+query-param = "api_key"
 "#,
                 secret.display()
             ),
@@ -726,7 +674,7 @@ source = "{}"
     }
 
     #[test]
-    fn load_inline_remove_header() {
+    fn load_remove_header() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("rules.toml");
         std::fs::write(
@@ -734,6 +682,7 @@ source = "{}"
             r#"
 [[host]]
 domain = "example.com"
+[[host.inject]]
 remove-header = "authorization"
 "#,
         )
@@ -743,364 +692,6 @@ remove-header = "authorization"
         match &hosts[0].injection_rules[0].injections[0] {
             Injection::RemoveHeader { name } => assert_eq!(name, "authorization"),
             other => panic!("expected RemoveHeader, got {:?}", other),
-        }
-    }
-
-    // ── load: rule sub-tables ─────────────────────────────────────────
-
-    #[test]
-    fn load_rule_subtable() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml_file = dir.path().join("modal.toml");
-        write_secret(
-            &toml_file,
-            r#"
-[christian-oudard]
-token_id = "ak-oDO-test123"
-token_secret = "as-PsX-test456"
-"#,
-        );
-
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-[[host]]
-domain = "api.modal.com"
-[[host.rule]]
-header = "x-modal-token-id"
-source = "{0}"
-source-path = "christian-oudard.token_id"
-[[host.rule]]
-header = "x-modal-token-secret"
-source = "{0}"
-source-path = "christian-oudard.token_secret"
-"#,
-                toml_file.display()
-            ),
-        )
-        .unwrap();
-
-        let hosts = load(&config_path).unwrap();
-        let rules = &hosts[0].injection_rules;
-        assert_eq!(rules.len(), 2);
-        match &rules[0].injections[0] {
-            Injection::SetHeader { name, value } => {
-                assert_eq!(name, "x-modal-token-id");
-                assert_eq!(value, "ak-oDO-test123");
-            }
-            other => panic!("expected SetHeader, got {:?}", other),
-        }
-        match &rules[1].injections[0] {
-            Injection::SetHeader { name, value } => {
-                assert_eq!(name, "x-modal-token-secret");
-                assert_eq!(value, "as-PsX-test456");
-            }
-            other => panic!("expected SetHeader, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn load_source_path_from_json() {
-        let dir = tempfile::tempdir().unwrap();
-        let json_file = dir.path().join("creds.json");
-        write_secret(&json_file, r#"{"token": {"access_token": "abc123"}}"#);
-
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-[[host]]
-domain = "example.com"
-header = "Authorization"
-source = "{}"
-source-path = "token.access_token"
-format = "Bearer {{}}"
-"#,
-                json_file.display()
-            ),
-        )
-        .unwrap();
-
-        let hosts = load(&config_path).unwrap();
-        match &hosts[0].injection_rules[0].injections[0] {
-            Injection::SetHeader { value, .. } => assert_eq!(value, "Bearer abc123"),
-            other => panic!("expected SetHeader, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn load_source_path_unknown_extension_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("creds.yaml");
-        write_secret(&file, "key: value");
-
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-[[host]]
-domain = "example.com"
-header = "x-token"
-source = "{}"
-source-path = "key"
-"#,
-                file.display()
-            ),
-        )
-        .unwrap();
-
-        let err = load(&config_path).unwrap_err();
-        assert!(format!("{err:?}").contains("unsupported"));
-    }
-
-    #[test]
-    fn load_source_path_array_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let json_file = dir.path().join("creds.json");
-        write_secret(&json_file, r#"{"tokens": ["first", "second"]}"#);
-
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-[[host]]
-domain = "example.com"
-source = "{}"
-source-path = "tokens.0"
-header = "Authorization"
-"#,
-                json_file.display()
-            ),
-        )
-        .unwrap();
-
-        let hosts = load(&config_path).unwrap();
-        match &hosts[0].injection_rules[0].injections[0] {
-            Injection::SetHeader { value, .. } => assert_eq!(value, "first"),
-            other => panic!("expected SetHeader, got {:?}", other),
-        }
-    }
-
-    // ── load: ports ────────────────────────────────────────────────────
-
-    #[test]
-    fn load_ports_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-[[host]]
-domain = "35.194.69.156"
-ports = [443]
-header = "authorization"
-value = "Bearer tok"
-"#,
-        )
-        .unwrap();
-
-        let hosts = load(&config_path).unwrap();
-        assert_eq!(hosts[0].ports, vec![443]);
-    }
-
-    #[test]
-    fn load_no_ports_field_defaults_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-[[host]]
-domain = "api.example.com"
-header = "x-api-key"
-value = "sk-123"
-"#,
-        )
-        .unwrap();
-
-        let hosts = load(&config_path).unwrap();
-        assert!(hosts[0].ports.is_empty());
-    }
-
-    // ── load: no-check-certificate ───────────────────────────────────
-
-    #[test]
-    fn load_no_check_certificate() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-[[host]]
-domain = "10.0.0.1"
-no-check-certificate = true
-header = "authorization"
-value = "Bearer tok"
-"#,
-        )
-        .unwrap();
-
-        let hosts = load(&config_path).unwrap();
-        assert!(hosts[0].no_check_certificate);
-    }
-
-    #[test]
-    fn load_no_check_certificate_defaults_false() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-[[host]]
-domain = "api.example.com"
-header = "x-api-key"
-value = "sk-123"
-"#,
-        )
-        .unwrap();
-
-        let hosts = load(&config_path).unwrap();
-        assert!(!hosts[0].no_check_certificate);
-    }
-
-    #[test]
-    fn resolve_propagates_no_check_certificate() {
-        let hosts = vec![ResolvedHost {
-            host_pattern: "10.0.0.1".to_string(),
-            ports: vec![],
-            no_check_certificate: true,
-            injection_rules: vec![InjectionRule {
-                path_pattern: "*".to_string(),
-                injections: vec![Injection::SetHeader {
-                    name: "authorization".to_string(),
-                    value: "Bearer tok".to_string(),
-                }],
-            }],
-        }];
-        let r = resolve("10.0.0.1:8443", &hosts);
-        assert!(r.no_check_certificate);
-    }
-
-    // ── load: misc ─────────────────────────────────────────────────────
-
-    #[test]
-    fn load_empty_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(&config_path, "").unwrap();
-
-        let hosts = load(&config_path).unwrap();
-        assert!(hosts.is_empty());
-    }
-
-    #[test]
-    fn load_multiple_hosts() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-[[host]]
-domain = "api.anthropic.com"
-header = "x-api-key"
-value = "sk-ant"
-
-[[host]]
-domain = "huggingface.co"
-header = "authorization"
-value = "Bearer hf-tok"
-"#,
-        )
-        .unwrap();
-
-        let hosts = load(&config_path).unwrap();
-        assert_eq!(hosts.len(), 2);
-        assert_eq!(hosts[0].host_pattern, "api.anthropic.com");
-        assert_eq!(hosts[1].host_pattern, "huggingface.co");
-    }
-
-    #[test]
-    fn load_mix_inline_and_subtable_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-[[host]]
-domain = "example.com"
-header = "x-inline"
-value = "inline-val"
-[[host.rule]]
-header = "x-extra"
-value = "extra-val"
-"#,
-        )
-        .unwrap();
-
-        let err = load(&config_path).unwrap_err();
-        assert!(format!("{err:?}").contains("inline fields or [[host.rule]]"));
-    }
-
-    // ── load: permissions ───────────────────────────────────────────────
-
-    #[cfg(unix)]
-    #[test]
-    fn load_rejects_world_readable_secret() {
-        let dir = tempfile::tempdir().unwrap();
-        let secret_path = dir.path().join("secret.key");
-        std::fs::write(&secret_path, "sk-test\n").unwrap();
-        // default 644 — should be rejected
-
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-[[host]]
-domain = "example.com"
-header = "x-api-key"
-source = "{}"
-"#,
-                secret_path.display()
-            ),
-        )
-        .unwrap();
-
-        let err = load(&config_path).unwrap_err();
-        assert!(format!("{err:?}").contains("must not be group/world-accessible"));
-    }
-
-    // ── load: relative source paths ───────────────────────────────────
-
-    #[test]
-    fn load_relative_source_resolves_to_secrets_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let secrets_dir = dir.path().join("secrets");
-        std::fs::create_dir(&secrets_dir).unwrap();
-        let secret_path = secrets_dir.join("my.key");
-        write_secret(&secret_path, "sk-relative-789\n");
-
-        let config_path = dir.path().join("rules.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-[[host]]
-domain = "example.com"
-header = "x-api-key"
-source = "my.key"
-"#,
-        )
-        .unwrap();
-
-        let hosts = load(&config_path).unwrap();
-        match &hosts[0].injection_rules[0].injections[0] {
-            Injection::SetHeader { value, .. } => assert_eq!(value, "sk-relative-789"),
-            other => panic!("expected SetHeader, got {:?}", other),
         }
     }
 
@@ -1127,12 +718,12 @@ secret = "as-test456"
 [[host]]
 domain = "api.example.com"
 source = "{0}"
-[[host.rule]]
-header = "x-id"
+[[host.inject]]
 source-path = "account.id"
-[[host.rule]]
-header = "x-secret"
+header = "x-id"
+[[host.inject]]
 source-path = "account.secret"
+header = "x-secret"
 "#,
                 toml_file.display()
             ),
@@ -1147,6 +738,351 @@ source-path = "account.secret"
                 assert_eq!(name, "x-id");
                 assert_eq!(value, "ak-test123");
             }
+            other => panic!("expected SetHeader, got {:?}", other),
+        }
+    }
+
+    // ── load: structured source-path ───────────────────────────────────
+
+    #[test]
+    fn load_source_path_from_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_file = dir.path().join("creds.json");
+        write_secret(&json_file, r#"{"token": {"access_token": "abc123"}}"#);
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source = "{}"
+source-path = "token.access_token"
+header = "Authorization"
+format = "Bearer {{}}"
+"#,
+                json_file.display()
+            ),
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        match &hosts[0].injection_rules[0].injections[0] {
+            Injection::SetHeader { value, .. } => assert_eq!(value, "Bearer abc123"),
+            other => panic!("expected SetHeader, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_source_path_array_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_file = dir.path().join("creds.json");
+        write_secret(&json_file, r#"{"tokens": ["first", "second"]}"#);
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source = "{}"
+source-path = "tokens.0"
+header = "Authorization"
+"#,
+                json_file.display()
+            ),
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        match &hosts[0].injection_rules[0].injections[0] {
+            Injection::SetHeader { value, .. } => assert_eq!(value, "first"),
+            other => panic!("expected SetHeader, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_source_path_unknown_extension_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("creds.yaml");
+        write_secret(&file, "key: value");
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source = "{}"
+source-path = "key"
+header = "x-token"
+"#,
+                file.display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(format!("{err:?}").contains("unsupported"));
+    }
+
+    // ── load: per-rule ports ────────────────────────────────────────────
+
+    #[test]
+    fn load_rule_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "35.194.69.156"
+[[host.inject]]
+ports = [8443]
+header = "authorization"
+value = "Bearer tok"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert_eq!(hosts[0].injection_rules[0].ports, vec![8443]);
+    }
+
+    // ── load: no-check-certificate ────────────────────────────────────
+
+    #[test]
+    fn load_no_check_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "10.0.0.1"
+no-check-certificate = true
+[[host.inject]]
+header = "authorization"
+value = "Bearer tok"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert!(hosts[0].no_check_certificate);
+    }
+
+    // ── load: access ──────────────────────────────────────────────────
+
+    #[test]
+    fn load_access_multiline() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "api.anthropic.com"
+access = """
+block *
+allow /v1/*
+"""
+[[host.inject]]
+header = "x-api-key"
+value = "sk-ant"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert_eq!(hosts[0].access.len(), 2);
+        assert_eq!(hosts[0].access[0].verb, AccessVerb::Block);
+        assert_eq!(hosts[0].access[1].verb, AccessVerb::Allow);
+    }
+
+    #[test]
+    fn load_access_single_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "telemetry.example.com"
+access = "block *"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert_eq!(hosts[0].access.len(), 1);
+        assert_eq!(hosts[0].access[0].verb, AccessVerb::Block);
+        assert!(hosts[0].injection_rules.is_empty());
+    }
+
+    #[test]
+    fn load_access_unnatural_order_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "api.example.com"
+access = """
+allow /v1/*
+block *
+"""
+[[host.inject]]
+header = "x-api-key"
+value = "sk"
+"#,
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(format!("{err:?}").contains("broader than earlier"));
+    }
+
+    // ── load: duplicate domains ───────────────────────────────────────
+
+    #[test]
+    fn load_duplicate_domain_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "api.example.com"
+[[host.inject]]
+header = "x-api-key"
+value = "first"
+
+[[host]]
+domain = "api.example.com"
+[[host.inject]]
+header = "x-api-key"
+value = "second"
+"#,
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(format!("{err:?}").contains("duplicate host"));
+    }
+
+    // ── load: misc ────────────────────────────────────────────────────
+
+    #[test]
+    fn load_multiple_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "api.anthropic.com"
+[[host.inject]]
+header = "x-api-key"
+value = "sk-ant"
+
+[[host]]
+domain = "huggingface.co"
+[[host.inject]]
+header = "authorization"
+value = "Bearer hf-tok"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0].host_pattern, "api.anthropic.com");
+        assert_eq!(hosts[1].host_pattern, "huggingface.co");
+    }
+
+    #[test]
+    fn load_rule_without_action_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+value = "whatever"
+"#,
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(format!("{err:?}").contains("header"));
+    }
+
+    // ── load: permissions ──────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_world_readable_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("secret.key");
+        std::fs::write(&secret_path, "sk-test\n").unwrap();
+        // default 644 — should be rejected
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source = "{}"
+header = "x-api-key"
+"#,
+                secret_path.display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(format!("{err:?}").contains("must not be group/world-accessible"));
+    }
+
+    // ── load: relative source paths ───────────────────────────────────
+
+    #[test]
+    fn load_relative_source_resolves_to_secrets_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir(&secrets_dir).unwrap();
+        let secret_path = secrets_dir.join("my.key");
+        write_secret(&secret_path, "sk-relative-789\n");
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source = "my.key"
+header = "x-api-key"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        match &hosts[0].injection_rules[0].injections[0] {
+            Injection::SetHeader { value, .. } => assert_eq!(value, "sk-relative-789"),
             other => panic!("expected SetHeader, got {:?}", other),
         }
     }
@@ -1174,5 +1110,4 @@ source-path = "account.secret"
     fn split_host_port_ipv6_no_port() {
         assert_eq!(split_host_port("[::1]"), ("::1", None));
     }
-
 }
