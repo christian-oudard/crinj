@@ -45,15 +45,43 @@ Canonical field order:
 2. `ports` — port list (array of u16, default all)
 3. `source` — credential source file
 4. `source-path` — dot-notation path into a structured source (JSON/TOML)
-5. `value` — inline literal (alternative to source/source-path)
-6. `header` / `query-param` / `remove-header` — action (exactly one)
-7. `format` — format string, `{}` substituted with resolved value
+5. `source-sqlite` — SQLite database path (alternative to source, for dynamic values)
+6. `source-sqlite-query` — SQL query returning one text value (required with source-sqlite)
+7. `value` — inline literal (alternative to source/source-path)
+8. `header` / `query-param` / `remove-header` — action (exactly one)
+9. `format` — format string, `{}` substituted with resolved value
 
 Each inject entry must have exactly one action. Credential source resolution:
 - `source` alone: read the whole file (trimmed)
 - `source` + `source-path`: parse as JSON/TOML (by extension) and extract the dotted path
+- `source-sqlite` + `source-sqlite-query`: query a SQLite database at request time (see below)
 - `value`: use the inline literal instead
 - If no entry-level `source`, inherit the host-level `source`.
+
+### SQLite sources
+
+For credentials that change over time (e.g. session cookies cached in a database), use `source-sqlite` and `source-sqlite-query` instead of `source`:
+
+```toml
+[[host]]
+domain = "main.yhlsoft.com"
+[[host.inject]]
+source-sqlite = "~/.cache/rhs/account_data.sqlite"
+source-sqlite-query = "SELECT json_extract(value, '$._yhlsoft_user') FROM cache WHERE key = 'cookie'"
+header = "Cookie"
+format = "_yhlsoft_user={}"
+```
+
+- `source-sqlite`: path to a SQLite database file (resolved like `source`: bare names relative to `secrets/`, `~/` for home, `/` for absolute)
+- `source-sqlite-query`: SQL query that returns a single text value (first column of first row)
+
+The query runs on every matching request, so the injected value always reflects the current database content. The database is opened read-only with a 1-second busy timeout.
+
+`source-sqlite` cannot be combined with `source`, `source-path`, or `value`. Both `source-sqlite` and `source-sqlite-query` must be present together.
+
+If the database does not exist at startup, crinj accepts the config (the file may be created later). If the query fails at request time (missing file, no rows, locked database), the injection is skipped with a warning log.
+
+Permission check: if the file exists at config load time, it must be mode 0o600 (same as other secret files).
 
 ### Glob patterns
 

@@ -4,6 +4,8 @@
 //! All injections require a placeholder: the header or query parameter must
 //! already exist in the request for injection to occur.
 
+use std::path::PathBuf;
+
 use anyhow::{bail, Result};
 use hyper::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -20,12 +22,24 @@ pub(crate) enum Injection {
         name: String,
         value: String,
     },
+    SetHeaderSqlite {
+        name: String,
+        db_path: PathBuf,
+        query: String,
+        format: Option<String>,
+    },
     RemoveHeader {
         name: String,
     },
     SetQueryParam {
         name: String,
         value: String,
+    },
+    SetQueryParamSqlite {
+        name: String,
+        db_path: PathBuf,
+        query: String,
+        format: Option<String>,
     },
 }
 
@@ -144,6 +158,44 @@ pub(crate) fn evaluate_access(path: &str, entries: &[AccessEntry]) -> Option<Acc
     result
 }
 
+// ── SQLite resolution ───────────────────────────────────────────────────
+
+/// Query a SQLite database for a single text value.
+fn resolve_sqlite(
+    db_path: &std::path::Path,
+    query: &str,
+    format: &Option<String>,
+) -> Option<String> {
+    match resolve_sqlite_inner(db_path, query) {
+        Ok(raw) => {
+            let value = match format {
+                Some(fmt) => fmt.replace("{}", &raw),
+                None => raw,
+            };
+            Some(value)
+        }
+        Err(e) => {
+            warn!(
+                db = %db_path.display(),
+                error = %e,
+                "sqlite injection failed"
+            );
+            None
+        }
+    }
+}
+
+fn resolve_sqlite_inner(db_path: &std::path::Path, query: &str) -> Result<String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(1))?;
+    let value: String = conn.query_row(query, [], |row| row.get(0))?;
+    Ok(value)
+}
+
 // ── Injection application ───────────────────────────────────────────────
 
 /// Apply injection rules to the request headers.
@@ -180,6 +232,26 @@ pub(crate) fn apply_injections(
                         );
                     }
                 }
+                Injection::SetHeaderSqlite {
+                    name,
+                    db_path,
+                    query,
+                    format,
+                } => {
+                    let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+                        continue;
+                    };
+                    if !headers.contains_key(&header_name) {
+                        continue;
+                    }
+                    if let Some(value) = resolve_sqlite(db_path, query, format) {
+                        if let Ok(header_value) = HeaderValue::from_str(&value) {
+                            headers.insert(header_name.clone(), header_value);
+                            debug!(header = %header_name, "injected header (sqlite)");
+                            count += 1;
+                        }
+                    }
+                }
                 Injection::RemoveHeader { name } => {
                     if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
                         if headers.remove(&header_name).is_some() {
@@ -188,7 +260,7 @@ pub(crate) fn apply_injections(
                         }
                     }
                 }
-                Injection::SetQueryParam { .. } => {} // handled by apply_query_injections
+                Injection::SetQueryParam { .. } | Injection::SetQueryParamSqlite { .. } => {}
             }
         }
     }
@@ -215,17 +287,31 @@ pub(crate) fn apply_query_injections(
         })
         .unwrap_or_default();
 
-    let mut params_to_set: Vec<(&str, &str)> = Vec::new();
+    let mut params_to_set: Vec<(String, String)> = Vec::new();
     for rule in rules {
         if !glob::matches(path, &rule.path_pattern) {
             continue;
         }
         for injection in &rule.injections {
-            if let Injection::SetQueryParam { name, value } = injection {
-                if !existing_params.contains(name.as_str()) {
-                    continue;
+            match injection {
+                Injection::SetQueryParam { name, value } => {
+                    if existing_params.contains(name.as_str()) {
+                        params_to_set.push((name.clone(), value.clone()));
+                    }
                 }
-                params_to_set.push((name, value));
+                Injection::SetQueryParamSqlite {
+                    name,
+                    db_path,
+                    query,
+                    format,
+                } => {
+                    if existing_params.contains(name.as_str()) {
+                        if let Some(value) = resolve_sqlite(db_path, query, format) {
+                            params_to_set.push((name.clone(), value));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -240,7 +326,7 @@ pub(crate) fn apply_query_injections(
     }
 
     let inject_names: std::collections::HashSet<&str> =
-        params_to_set.iter().map(|(n, _)| *n).collect();
+        params_to_set.iter().map(|(n, _)| n.as_str()).collect();
     let mut parts: Vec<String> = Vec::new();
     if let Some(q) = existing_query {
         for pair in q.split('&') {
@@ -506,5 +592,146 @@ allow /v1/*
         assert_eq!(evaluate_access("/v1/admin/x", &entries), Some(AccessVerb::Block));
         assert_eq!(evaluate_access("/v1/users", &entries), Some(AccessVerb::Allow));
         assert_eq!(evaluate_access("/anything", &entries), Some(AccessVerb::Block));
+    }
+
+    // ── SQLite injection ──────────────────────────────────────────────────
+
+    fn create_test_db(dir: &std::path::Path) -> PathBuf {
+        let db_path = dir.join("test.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cache (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO cache VALUES ('cookie', 'session_abc123');",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        db_path
+    }
+
+    #[test]
+    fn sqlite_header_injection_replaces_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_test_db(dir.path());
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("cookie", HeaderValue::from_static("PLACEHOLDER"));
+
+        let rules = vec![make_rule(
+            "*",
+            vec![Injection::SetHeaderSqlite {
+                name: "cookie".to_string(),
+                db_path,
+                query: "SELECT value FROM cache WHERE key = 'cookie'".to_string(),
+                format: Some("_yhlsoft_user={}".to_string()),
+            }],
+        )];
+
+        let count = apply_injections(&mut headers, "/api/data", &rules);
+        assert_eq!(count, 1);
+        assert_eq!(
+            headers.get("cookie").unwrap(),
+            "_yhlsoft_user=session_abc123"
+        );
+    }
+
+    #[test]
+    fn sqlite_header_injection_skips_when_no_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_test_db(dir.path());
+
+        let mut headers = hyper::HeaderMap::new();
+        // No cookie header present.
+
+        let rules = vec![make_rule(
+            "*",
+            vec![Injection::SetHeaderSqlite {
+                name: "cookie".to_string(),
+                db_path,
+                query: "SELECT value FROM cache WHERE key = 'cookie'".to_string(),
+                format: None,
+            }],
+        )];
+
+        let count = apply_injections(&mut headers, "/api/data", &rules);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn sqlite_header_injection_skips_on_missing_db() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("cookie", HeaderValue::from_static("PLACEHOLDER"));
+
+        let rules = vec![make_rule(
+            "*",
+            vec![Injection::SetHeaderSqlite {
+                name: "cookie".to_string(),
+                db_path: PathBuf::from("/nonexistent/test.sqlite"),
+                query: "SELECT value FROM cache WHERE key = 'cookie'".to_string(),
+                format: None,
+            }],
+        )];
+
+        let count = apply_injections(&mut headers, "/api/data", &rules);
+        assert_eq!(count, 0);
+        // Placeholder is not replaced.
+        assert_eq!(headers.get("cookie").unwrap(), "PLACEHOLDER");
+    }
+
+    #[test]
+    fn sqlite_query_param_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_test_db(dir.path());
+
+        let rules = vec![make_rule(
+            "*",
+            vec![Injection::SetQueryParamSqlite {
+                name: "token".to_string(),
+                db_path,
+                query: "SELECT value FROM cache WHERE key = 'cookie'".to_string(),
+                format: None,
+            }],
+        )];
+
+        let (result, count) =
+            apply_query_injections("/api/data?token=PLACEHOLDER&foo=bar", &rules);
+        assert_eq!(count, 1);
+        assert!(result.contains("token=session_abc123"));
+        assert!(result.contains("foo=bar"));
+    }
+
+    #[test]
+    fn sqlite_reads_updated_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_test_db(dir.path());
+
+        // Update the value after initial creation.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE cache SET value = 'new_session_xyz' WHERE key = 'cookie'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("cookie", HeaderValue::from_static("PLACEHOLDER"));
+
+        let rules = vec![make_rule(
+            "*",
+            vec![Injection::SetHeaderSqlite {
+                name: "cookie".to_string(),
+                db_path,
+                query: "SELECT value FROM cache WHERE key = 'cookie'".to_string(),
+                format: None,
+            }],
+        )];
+
+        let count = apply_injections(&mut headers, "/", &rules);
+        assert_eq!(count, 1);
+        assert_eq!(headers.get("cookie").unwrap(), "new_session_xyz");
     }
 }

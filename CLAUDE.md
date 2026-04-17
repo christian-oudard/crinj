@@ -61,7 +61,7 @@ access = "block *"
 All header and query-param injections require placeholders: the field must already exist in the request.
 
 Canonical field order — host: `domain`, `no-check-certificate`, `access`, `source`, `inject`.
-Canonical field order — inject: `url-path`, `ports`, `source`, `source-path`, `value`, `header`/`query-param`/`remove-header`, `format`.
+Canonical field order — inject: `url-path`, `ports`, `source`, `source-path`, `source-sqlite`, `source-sqlite-query`, `value`, `header`/`query-param`/`remove-header`, `format`.
 
 Host selection is most-specific-wins (fewer `*` then longer literal portion). Tie = config error.
 Access control is last-match-wins with natural-order enforcement (broader before narrower).

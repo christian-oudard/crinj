@@ -66,6 +66,10 @@ struct InjectEntry {
     source: Option<String>,
     #[serde(default, rename = "source-path")]
     source_path: Option<String>,
+    #[serde(default, rename = "source-sqlite")]
+    source_sqlite: Option<String>,
+    #[serde(default, rename = "source-sqlite-query")]
+    source_sqlite_query: Option<String>,
     #[serde(default)]
     value: Option<String>,
     #[serde(default)]
@@ -167,6 +171,12 @@ fn resolve_injection(
             name: name.clone(),
         });
     }
+
+    // SQLite source: deferred resolution at request time.
+    if entry.source_sqlite.is_some() || entry.source_sqlite_query.is_some() {
+        return resolve_sqlite_injection(entry, domain, config_path);
+    }
+
     if let Some(ref name) = entry.header {
         let raw = resolve_value(entry, fallback_source, domain, config_path)?;
         let value = format_value(&raw, &entry.format);
@@ -185,6 +195,65 @@ fn resolve_injection(
     }
     bail!(
         "inject entry for domain {:?} in {} must have `header`, `query-param`, or `remove-header`",
+        domain,
+        config_path.display()
+    );
+}
+
+/// Resolve a SQLite-backed inject entry. The actual query runs at request time,
+/// but we validate the config and resolve the path here.
+fn resolve_sqlite_injection(
+    entry: &InjectEntry,
+    domain: &str,
+    config_path: &Path,
+) -> Result<Injection> {
+    let sqlite_path = entry.source_sqlite.as_ref().with_context(|| {
+        format!(
+            "inject entry for domain {:?} in {}: \
+             `source-sqlite-query` requires `source-sqlite`",
+            domain,
+            config_path.display()
+        )
+    })?;
+    let query = entry.source_sqlite_query.as_ref().with_context(|| {
+        format!(
+            "inject entry for domain {:?} in {}: \
+             `source-sqlite` requires `source-sqlite-query`",
+            domain,
+            config_path.display()
+        )
+    })?;
+    if entry.source.is_some() || entry.value.is_some() || entry.source_path.is_some() {
+        bail!(
+            "inject entry for domain {:?} in {}: \
+             `source-sqlite` cannot be combined with `source`, `source-path`, or `value`",
+            domain,
+            config_path.display()
+        );
+    }
+    let db_path = resolve_source_path(sqlite_path, config_path);
+    if db_path.exists() {
+        check_file_permissions(&db_path)?;
+    }
+    if let Some(ref name) = entry.header {
+        return Ok(Injection::SetHeaderSqlite {
+            name: name.clone(),
+            db_path,
+            query: query.clone(),
+            format: entry.format.clone(),
+        });
+    }
+    if let Some(ref name) = entry.query_param {
+        return Ok(Injection::SetQueryParamSqlite {
+            name: name.clone(),
+            db_path,
+            query: query.clone(),
+            format: entry.format.clone(),
+        });
+    }
+    bail!(
+        "inject entry for domain {:?} in {}: \
+         `source-sqlite` inject entry must have `header` or `query-param`",
         domain,
         config_path.display()
     );
@@ -1055,6 +1124,225 @@ header = "x-api-key"
 
         let err = load(&config_path).unwrap_err();
         assert!(format!("{err:?}").contains("must not be group/world-accessible"));
+    }
+
+    // ── load: relative source paths ───────────────────────────────────
+
+    // ── load: source-sqlite ──────────────────────────────────────────
+
+    #[test]
+    fn load_source_sqlite_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cache (key TEXT, value TEXT);
+             INSERT INTO cache VALUES ('tok', 'secret123');",
+        )
+        .unwrap();
+        drop(conn);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source-sqlite = "{}"
+source-sqlite-query = "SELECT value FROM cache WHERE key = 'tok'"
+header = "cookie"
+format = "session={{}}"
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert_eq!(hosts.len(), 1);
+        match &hosts[0].injection_rules[0].injections[0] {
+            Injection::SetHeaderSqlite {
+                name,
+                db_path: p,
+                query,
+                format,
+            } => {
+                assert_eq!(name, "cookie");
+                assert_eq!(p, &db_path);
+                assert_eq!(query, "SELECT value FROM cache WHERE key = 'tok'");
+                assert_eq!(format.as_deref(), Some("session={}"));
+            }
+            other => panic!("expected SetHeaderSqlite, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_source_sqlite_query_param() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('val');")
+            .unwrap();
+        drop(conn);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source-sqlite = "{}"
+source-sqlite-query = "SELECT v FROM t LIMIT 1"
+query-param = "key"
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        match &hosts[0].injection_rules[0].injections[0] {
+            Injection::SetQueryParamSqlite { name, .. } => {
+                assert_eq!(name, "key");
+            }
+            other => panic!("expected SetQueryParamSqlite, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_source_sqlite_missing_query_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source-sqlite = "/tmp/test.sqlite"
+header = "cookie"
+"#,
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("source-sqlite-query"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_source_sqlite_query_without_sqlite_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source-sqlite-query = "SELECT 1"
+header = "cookie"
+"#,
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("source-sqlite"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_source_sqlite_conflicts_with_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.key");
+        write_secret(&secret, "val");
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source = "{}"
+source-sqlite = "/tmp/test.sqlite"
+source-sqlite-query = "SELECT 1"
+header = "cookie"
+"#,
+                secret.display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("cannot be combined"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_source_sqlite_without_action_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source-sqlite = "/tmp/test.sqlite"
+source-sqlite-query = "SELECT 1"
+"#,
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("header") || format!("{err:?}").contains("query-param"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_source_sqlite_nonexistent_file_accepted() {
+        // File doesn't exist yet, but config should still load (it may be created later).
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source-sqlite = "/tmp/nonexistent_crinj_test.sqlite"
+source-sqlite-query = "SELECT 1"
+header = "cookie"
+"#,
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert_eq!(hosts.len(), 1);
     }
 
     // ── load: relative source paths ───────────────────────────────────
