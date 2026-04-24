@@ -419,13 +419,13 @@ async fn forward_request(
     }
 
     let (path, query_injection_count) =
-        inject::apply_query_injections(&raw_path, injection_rules);
+        inject::apply_query_injections(&raw_path, injection_rules)?;
 
     let (mut parts, body) = req.into_parts();
 
     // Filter hop-by-hop headers, apply injections.
     let mut headers = filter_headers(&parts.headers);
-    let injection_count = inject::apply_injections(&mut headers, &path, injection_rules);
+    let injection_count = inject::apply_injections(&mut headers, &path, injection_rules)?;
 
     // Reconstruct request with path-only URI (not full URL).
     parts.headers = headers;
