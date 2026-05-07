@@ -70,4 +70,4 @@ Inject entries are cumulative across all matching entries.
 Glob patterns: `*` matches any sequence of characters (including dots), literal elsewhere.
 
 Source path resolution: bare names → `<config_dir>/secrets/<name>`, `~/...` → home-relative, `/...` → absolute.
-Secret files must be chmod 600 (no group/world access) or crinj refuses to start.
+Secret files must be chmod 600. A populated secret file with wider permissions is treated as an emergency (the secret has already leaked) and crinj refuses to start. A missing or zero-byte secret file is treated as "key not provided yet": that host is skipped with a warning and crinj keeps starting. Schema errors in rules.toml are collected across all hosts and reported together at startup.

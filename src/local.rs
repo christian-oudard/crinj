@@ -6,11 +6,31 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::glob;
 use crate::inject::{self, AccessEntry, Injection, InjectionRule};
+
+/// Marker error attached to failures that come from a host's secret being
+/// unreadable (missing file, wrong permissions, etc.) as opposed to a schema
+/// mistake in rules.toml. Present in the error chain when this distinction
+/// matters at the load level.
+#[derive(Debug)]
+struct SecretUnavailable;
+
+impl std::fmt::Display for SecretUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("secret unavailable")
+    }
+}
+
+impl std::error::Error for SecretUnavailable {}
+
+fn is_secret_unavailable(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| c.is::<SecretUnavailable>())
+}
 
 // ── TOML schema ─────────────────────────────────────────────────────────
 
@@ -103,23 +123,50 @@ pub(crate) fn load(path: &Path) -> Result<Vec<ResolvedHost>> {
         toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
 
     let mut resolved = Vec::with_capacity(config.host.len());
+    let mut fatal: Vec<anyhow::Error> = Vec::new();
     for entry in config.host {
-        let access = match &entry.access {
-            Some(s) => inject::parse_access(s).with_context(|| {
-                format!("host {:?} in {}", entry.domain, path.display())
-            })?,
-            None => Vec::new(),
-        };
-        let injection_rules = resolve_host_injects(&entry, path)?;
-        resolved.push(ResolvedHost {
-            host_pattern: entry.domain,
-            no_check_certificate: entry.no_check_certificate,
-            access,
-            injection_rules,
-        });
+        match resolve_host(&entry, path) {
+            Ok(host) => resolved.push(host),
+            Err(e) if is_secret_unavailable(&e) => warn!(
+                domain = %entry.domain,
+                error = format!("{e:#}"),
+                "skipping host: secret not available"
+            ),
+            Err(e) => fatal.push(e),
+        }
+    }
+    if !fatal.is_empty() {
+        let combined = fatal
+            .iter()
+            .map(|e| format!("  - {e:#}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(
+            "{} host config error(s) in {}:\n{}",
+            fatal.len(),
+            path.display(),
+            combined
+        );
     }
     validate_host_specificity(&resolved)?;
     Ok(resolved)
+}
+
+/// Build a fully resolved host. Any failure here causes the host to be skipped
+/// at the call site with a warning.
+fn resolve_host(entry: &HostEntry, path: &Path) -> Result<ResolvedHost> {
+    let access = match &entry.access {
+        Some(s) => inject::parse_access(s)
+            .with_context(|| format!("host {:?} in {}", entry.domain, path.display()))?,
+        None => Vec::new(),
+    };
+    let injection_rules = resolve_host_injects(entry, path)?;
+    Ok(ResolvedHost {
+        host_pattern: entry.domain.clone(),
+        no_check_certificate: entry.no_check_certificate,
+        access,
+        injection_rules,
+    })
 }
 
 /// Error out if two host entries have equal specificity (duplicate domains).
@@ -232,9 +279,10 @@ fn resolve_sqlite_injection(
         );
     }
     let db_path = resolve_source_path(sqlite_path, config_path);
-    if db_path.exists() {
-        check_file_permissions(&db_path)?;
-    }
+    // Validate permissions if the file is present and populated; missing/empty
+    // SQLite files are handled at request time (the query simply fails to
+    // find rows). Bad permissions on a populated db is an emergency.
+    validate_secret_file(&db_path)?;
     if let Some(ref name) = entry.header {
         return Ok(Injection::SetHeaderSqlite {
             name: name.clone(),
@@ -282,7 +330,27 @@ fn resolve_value(
     let source = entry.source.as_deref().or(fallback_source);
     if let Some(source) = source {
         let expanded = resolve_source_path(source, config_path);
-        check_file_permissions(&expanded)?;
+        match validate_secret_file(&expanded)? {
+            SecretState::Missing => {
+                return Err(anyhow!(SecretUnavailable)).with_context(|| {
+                    format!(
+                        "secret file {} does not exist (for domain {:?})",
+                        expanded.display(),
+                        domain
+                    )
+                });
+            }
+            SecretState::Empty => {
+                return Err(anyhow!(SecretUnavailable)).with_context(|| {
+                    format!(
+                        "secret file {} is empty (for domain {:?})",
+                        expanded.display(),
+                        domain
+                    )
+                });
+            }
+            SecretState::Populated => {}
+        }
         let content = std::fs::read_to_string(&expanded).with_context(|| {
             format!(
                 "reading source {} (for domain {:?}) referenced from {}",
@@ -312,23 +380,49 @@ fn resolve_value(
     );
 }
 
-/// Refuse to load a secret file with group/world-readable permissions.
-fn check_file_permissions(_path: &Path) -> Result<()> {
+enum SecretState {
+    /// File does not exist. Treat as "key not provided yet" (warn, skip host).
+    Missing,
+    /// File exists but is zero bytes. Same treatment as Missing.
+    Empty,
+    /// File exists with non-zero contents and acceptable permissions.
+    Populated,
+}
+
+/// Inspect a secret file. Empty/missing files yield non-fatal states. A
+/// populated file with group/world-readable permissions is an emergency:
+/// the secret has already been exposed. We refuse to load and exit so the
+/// user fixes it before the proxy runs another second.
+fn validate_secret_file(path: &Path) -> Result<SecretState> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SecretState::Missing),
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("stat'ing secret file {}", path.display()));
+        }
+    };
+
+    let empty = meta.len() == 0;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if let Ok(meta) = std::fs::metadata(_path) {
-            let mode = meta.mode() & 0o777;
-            if mode & 0o077 != 0 {
-                bail!(
-                    "secret file {} has mode {:o} — must not be group/world-accessible (chmod 600)",
-                    _path.display(),
-                    mode,
-                );
-            }
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 && !empty {
+            bail!(
+                "secret file {} has mode {:o} — must not be group/world-accessible (chmod 600)",
+                path.display(),
+                mode,
+            );
         }
     }
-    Ok(())
+
+    if empty {
+        Ok(SecretState::Empty)
+    } else {
+        Ok(SecretState::Populated)
+    }
 }
 
 /// Auto-detect format from file extension and extract a dot-separated path.
@@ -1096,15 +1190,101 @@ value = "whatever"
         assert!(format!("{err:?}").contains("header"));
     }
 
+    #[test]
+    fn load_collects_multiple_schema_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[host]]
+domain = "a.example.com"
+[[host.inject]]
+value = "x"
+
+[[host]]
+domain = "b.example.com"
+[[host.inject]]
+value = "y"
+"#,
+        )
+        .unwrap();
+
+        let err = load(&config_path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("a.example.com"), "missing a.example.com: {msg}");
+        assert!(msg.contains("b.example.com"), "missing b.example.com: {msg}");
+    }
+
+    #[test]
+    fn load_missing_secret_file_skips_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "broken.example.com"
+[[host.inject]]
+header = "x-api-key"
+source = "{}/does-not-exist"
+
+[[host]]
+domain = "ok.example.com"
+[[host.inject]]
+header = "x-api-key"
+value = "sk-good"
+"#,
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].host_pattern, "ok.example.com");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_empty_secret_with_bad_perms_skips_host() {
+        // touch'd file with default 644: nothing to leak yet, treat as
+        // "key not provided" and warn-and-skip.
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("secret.key");
+        std::fs::write(&secret_path, "").unwrap();
+
+        let config_path = dir.path().join("rules.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[[host]]
+domain = "example.com"
+[[host.inject]]
+source = "{}"
+header = "x-api-key"
+"#,
+                secret_path.display()
+            ),
+        )
+        .unwrap();
+
+        let hosts = load(&config_path).unwrap();
+        assert!(hosts.is_empty());
+    }
+
     // ── load: permissions ──────────────────────────────────────────────
 
     #[cfg(unix)]
     #[test]
-    fn load_rejects_world_readable_secret() {
+    fn load_populated_world_readable_secret_fails() {
+        // A populated key with 644 perms is an emergency: the secret has
+        // already leaked. Refuse to start.
         let dir = tempfile::tempdir().unwrap();
         let secret_path = dir.path().join("secret.key");
         std::fs::write(&secret_path, "sk-test\n").unwrap();
-        // default 644 — should be rejected
 
         let config_path = dir.path().join("rules.toml");
         std::fs::write(
