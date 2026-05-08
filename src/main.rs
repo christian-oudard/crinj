@@ -125,13 +125,17 @@ async fn main() -> Result<()> {
         (LogFormat::Json, None) => tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .json()
+            .with_writer(std::io::stderr)
             .init(),
         (LogFormat::Text, Some(file)) => tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_writer(file)
             .with_ansi(false)
             .init(),
-        (LogFormat::Text, None) => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
+        (LogFormat::Text, None) => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .init(),
     }
 
     let data_dir = resolve_data_dir(cli.data_dir.as_deref());
