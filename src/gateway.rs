@@ -364,9 +364,7 @@ async fn mitm(
             .await
             .context("HTTP/1.1 handshake with upstream")?;
     tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            warn!(error = %e, "upstream connection error");
-        }
+        let _ = conn.await;
     });
 
     let host_owned = host.to_string();
