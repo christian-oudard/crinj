@@ -8,7 +8,7 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -45,6 +45,17 @@ struct Cli {
     /// Write log output to a file instead of stderr.
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Log output format. `text` for humans; `json` produces one JSON object
+    /// per line so a parent process (e.g. cav) can dispatch on level/fields.
+    #[arg(long, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 // ── XDG path resolution ─────────────────────────────────────────────────
@@ -94,19 +105,33 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if let Some(ref log_file) = cli.log_file {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file)
-            .with_context(|| format!("opening log file {}", log_file.display()))?;
-        tracing_subscriber::fmt()
+    let log_writer: Option<std::fs::File> = match cli.log_file.as_ref() {
+        Some(path) => Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("opening log file {}", path.display()))?,
+        ),
+        None => None,
+    };
+    match (cli.log_format, log_writer) {
+        (LogFormat::Json, Some(file)) => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .with_writer(file)
+            .with_ansi(false)
+            .init(),
+        (LogFormat::Json, None) => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .init(),
+        (LogFormat::Text, Some(file)) => tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_writer(file)
             .with_ansi(false)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+            .init(),
+        (LogFormat::Text, None) => tracing_subscriber::fmt().with_env_filter(env_filter).init(),
     }
 
     let data_dir = resolve_data_dir(cli.data_dir.as_deref());
