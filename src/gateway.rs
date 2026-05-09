@@ -15,7 +15,7 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::ca::CertificateAuthority;
 use crate::inject::{self, AccessEntry, AccessVerb, InjectionRule};
@@ -112,7 +112,7 @@ impl GatewayServer {
             if let Err(e) =
                 handle_connection(stream, peer_addr, ca, upstream_tls, upstream_tls_no_check, upstream_proxy, rules).await
             {
-                warn!(peer = %peer_addr, error = %e, "connection error");
+                debug!(peer = %peer_addr, error = %e, "connection error");
             }
         });
     }
@@ -308,7 +308,7 @@ async fn handle_connect(
                     tunnel(upgraded, &host, upstream_proxy.as_ref().as_ref()).await
                 };
                 if let Err(e) = result {
-                    warn!(host = %host, error = %e, "connection error");
+                    debug!(host = %host, error = %e, "connection error");
                 }
             }
             Err(e) => {
