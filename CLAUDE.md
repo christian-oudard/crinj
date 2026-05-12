@@ -5,24 +5,41 @@ Local MITM proxy that injects credentials into outbound HTTP requests based on T
 ## Commands
 
 ```bash
-cargo build                    # Build
-cargo test                     # Run tests
-cargo run -- --config rules.toml  # Run with config
-nix build                     # Nix build
-nix develop                   # Dev shell
+CGO_ENABLED=0 go build              # Build (pure-Go SQLite, no gcc needed)
+CGO_ENABLED=0 go test ./...         # Run tests
+CGO_ENABLED=0 go run . --config rules.toml  # Run with config
+nix build                           # Nix build via buildGoModule
+nix develop                         # Dev shell (go, gopls, gotools)
 ```
 
 ## Structure
 
+Flat Go package at the repo root:
+
 ```
-src/
-  main.rs      # CLI, XDG path resolution, startup
-  gateway.rs   # MITM proxy server, connection handling, SIGHUP reload
-  ca.rs        # Certificate authority (generate/persist CA, issue leaf certs)
-  inject.rs    # Injection engine (headers, query params, path matching)
-  local.rs     # TOML config loading and value resolution
-flake.nix      # Nix build + NixOS module
+main.go        # CLI, XDG path resolution, startup
+gateway.go     # MITM proxy server, connection handling, SIGHUP reload
+ca.go          # Certificate authority (generate/persist CA, issue leaf certs)
+inject.go      # Injection engine (headers, query params, path matching)
+local.go       # TOML config loading and value resolution
+glob.go        # Shared glob matcher / specificity / superset checks
+flake.nix      # Nix build (buildGoModule) + NixOS module
+go.mod / go.sum
 ```
+
+modernc.org/sqlite is the SQLite driver (pure-Go, transpiled from C). Keep
+`CGO_ENABLED=0` so builds stay fast: with cgo on, `net` and similar stdlib
+packages compile a C path that slows every build, and any cgo-based SQLite
+alternative would recompile bundled C source on each invocation — giving
+back the compile-speed win that motivated leaving Rust. The Nix build sets
+the env var via `env.CGO_ENABLED = "0"` in `flake.nix`. If you run `go test`
+or `go build` without it set, you'll hit `cgo: C compiler "gcc" not found`
+— enter a shell with gcc (`nix shell nixpkgs#gcc`) or, preferably, just
+export `CGO_ENABLED=0`.
+
+When dependencies change, re-derive the Nix `vendorHash` in `flake.nix`: set
+it to `sha256-A...A=` (forty-three A's), run `nix build`, copy the suggested
+hash from the error message into the flake.
 
 ## Config format
 

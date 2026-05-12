@@ -1,27 +1,24 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs, crane }: let
+  outputs = { self, nixpkgs }: let
     system = "x86_64-linux";
     pkgs = import nixpkgs { inherit system; };
-    craneLib = crane.mkLib pkgs;
 
-    src = craneLib.cleanCargoSource ./.;
-
-    commonArgs = {
-      inherit src;
+    crinj = pkgs.buildGoModule {
       pname = "crinj";
       version = "0.1.0";
+      src = ./.;
+
+      # Pure-Go SQLite (modernc.org/sqlite) keeps cgo off and the build fast.
+      env.CGO_ENABLED = "0";
+
+      vendorHash = "sha256-5YluHJOf6JfdFsglR9EKrTwZmw558eglAiXhwmFTdsc=";
+
+      ldflags = [ "-s" "-w" ];
     };
-
-    cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-    crinj = craneLib.buildPackage (commonArgs // {
-      inherit cargoArtifacts;
-    });
 
   in {
     packages.${system} = {
@@ -91,8 +88,7 @@
     };
 
     devShells.${system}.default = pkgs.mkShell {
-      inputsFrom = [ crinj ];
-      packages = [ pkgs.clippy pkgs.rustfmt ];
+      packages = [ pkgs.go pkgs.gopls pkgs.gotools ];
     };
   };
 }
