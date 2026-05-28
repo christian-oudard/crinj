@@ -283,29 +283,6 @@ func TestLeafCacheReturnsSameConfigWithinValidity(t *testing.T) {
 	}
 }
 
-func TestLeafCacheRegeneratesWhenExpired(t *testing.T) {
-	ca := testCA(t)
-	a, err := ca.ServerConfigForHost("expire.example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Manually expire the cached entry so the next lookup falls past the
-	// refresh-buffer cutoff.
-	ca.cacheMu.Lock()
-	if entry, ok := ca.leafCache["expire.example.com"]; ok {
-		entry.expiresAt = time.Time{} // far in the past
-	}
-	ca.cacheMu.Unlock()
-
-	b, err := ca.ServerConfigForHost("expire.example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a == b {
-		t.Error("expected fresh *tls.Config after expiry")
-	}
-}
-
 func TestLeafCertHandlesIPAddressHostname(t *testing.T) {
 	ca := testCA(t)
 	cfg, err := ca.ServerConfigForHost("10.0.0.1")

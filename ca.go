@@ -25,18 +25,14 @@ import (
 // on the fly so the gateway can terminate TLS with clients while forwarding to
 // the real upstream.
 
-const (
-	caValidityDays    = 3650
-	leafValidityHours = 24
-	leafRefreshBuffer = time.Hour
-	localCACN         = "Crinj Local CA"
-)
+const localCACN = "Crinj Local CA"
 
-// cachedCert is one entry in the leaf cache.
-type cachedCert struct {
-	config    *tls.Config
-	expiresAt time.Time
-}
+// neverExpires is the RFC 5280 §4.1.2.5 sentinel for certs with no
+// well-defined expiration. Leaf private keys live only in this process and
+// the CA root is installed only in the local cave trust store, so cert
+// expiry buys nothing here and previously caused false-positive "expired"
+// errors on long-running sessions and after suspend/NTP clock jumps.
+var neverExpires = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
 
 // CertificateAuthority is the in-process CA. It is safe for concurrent use.
 type CertificateAuthority struct {
@@ -45,7 +41,7 @@ type CertificateAuthority struct {
 	caKey     *ecdsa.PrivateKey
 
 	cacheMu   sync.Mutex
-	leafCache map[string]*cachedCert
+	leafCache map[string]*tls.Config
 }
 
 // LoadOrGenerateCA loads the CA from environment variables, then disk, or
@@ -106,7 +102,7 @@ func loadCAFromPEM(keyPEM, certPEM string) (*CertificateAuthority, error) {
 		caCert:    caCert,
 		caCertDER: certBlock.Bytes,
 		caKey:     priv,
-		leafCache: map[string]*cachedCert{},
+		leafCache: map[string]*tls.Config{},
 	}, nil
 }
 
@@ -187,7 +183,7 @@ func generateCA() (*CertificateAuthority, error) {
 			Organization: []string{"Crinj"},
 		},
 		NotBefore:             now,
-		NotAfter:              now.Add(time.Duration(caValidityDays) * 24 * time.Hour),
+		NotAfter:              neverExpires,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
@@ -204,7 +200,7 @@ func generateCA() (*CertificateAuthority, error) {
 		caCert:    caCert,
 		caCertDER: caCertDER,
 		caKey:     priv,
-		leafCache: map[string]*cachedCert{},
+		leafCache: map[string]*tls.Config{},
 	}, nil
 }
 
@@ -215,18 +211,13 @@ func (ca *CertificateAuthority) CACertPEM() string {
 }
 
 // ServerConfigForHost returns a *tls.Config ready for a TLS handshake with a
-// client requesting `hostname`. Cached configs are reused until they are
-// within leafRefreshBuffer of expiring, at which point a fresh leaf is signed.
+// client requesting `hostname`. Leaves are minted once per hostname and
+// reused for the lifetime of the process.
 func (ca *CertificateAuthority) ServerConfigForHost(hostname string) (*tls.Config, error) {
-	now := time.Now()
 	ca.cacheMu.Lock()
-	if entry, ok := ca.leafCache[hostname]; ok {
-		refreshAt := entry.expiresAt.Add(-leafRefreshBuffer)
-		if now.Before(refreshAt) {
-			cfg := entry.config
-			ca.cacheMu.Unlock()
-			return cfg, nil
-		}
+	if cfg, ok := ca.leafCache[hostname]; ok {
+		ca.cacheMu.Unlock()
+		return cfg, nil
 	}
 	ca.cacheMu.Unlock()
 
@@ -236,10 +227,7 @@ func (ca *CertificateAuthority) ServerConfigForHost(hostname string) (*tls.Confi
 	}
 
 	ca.cacheMu.Lock()
-	ca.leafCache[hostname] = &cachedCert{
-		config:    cfg,
-		expiresAt: time.Now().Add(time.Duration(leafValidityHours) * time.Hour),
-	}
+	ca.leafCache[hostname] = cfg
 	ca.cacheMu.Unlock()
 	return cfg, nil
 }
@@ -263,7 +251,7 @@ func (ca *CertificateAuthority) generateLeaf(hostname string) (*tls.Config, erro
 		},
 		// Backdate slightly to tolerate client clock skew.
 		NotBefore:   now.Add(-5 * time.Minute),
-		NotAfter:    now.Add(time.Duration(leafValidityHours) * time.Hour),
+		NotAfter:    neverExpires,
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
