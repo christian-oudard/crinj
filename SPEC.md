@@ -83,6 +83,50 @@ If the database does not exist at startup, crinj accepts the config (the file ma
 
 Permission check: if the file exists at config load time, it must be mode 0o600 (same as other secret files).
 
+### OAuth passthrough
+
+For an OAuth provider, crinj brokers the token flow so a sandboxed client never holds a usable refresh token, and (for opaque-token providers) never a real access token either. The real tokens are captured in transit at the provider's token endpoint and held in a server-side vault; the client only ever sees opaque placeholders.
+
+OAuth is configured with a single `[host.oauth]` table under the `[[host]]` it protects — that host is the resource host:
+
+```toml
+[[host]]
+domain = "api.anthropic.com"
+access = "allow /v1/*"
+[host.oauth]
+token-host = "platform.claude.com"   # the IdP token endpoint
+token-path = "/v1/oauth/token"
+```
+
+`[host.oauth]` carries exactly two keys: `token-host` (defaulting to the resource domain) and `token-path`. There is no vault name and no configured fakes — a host injects one bearer, brokered through one token endpoint.
+
+The token host is **auto-intercepted** — crinj synthesizes an interception entry for it, so it needs no `[[host]]` of its own (the resource host already has one).
+
+A host family that shares one login (one token authorizes a whole API family, e.g. Google's `*.googleapis.com`) is a single wildcard resource host, so the endpoint is stated once with no repetition:
+
+```toml
+[[host]]
+domain = "*.googleapis.com"
+[host.oauth]
+token-host = "oauth2.googleapis.com"
+token-path = "/token"
+```
+
+Placeholders are **auto-minted**: crinj issues a placeholder that mimics the captured token's prefix (so a client-side format check like Anthropic's `sk-ant-oat01-` passes) with a unique random suffix. The suffix makes each login distinct, so one issuer can broker many tokens at once (multiple accounts, OAuth clients, or scopes); it is stable within a login, so the client's stored credentials do not change across refreshes.
+
+The flow is selective body rewrite at the token endpoint plus header injection on the resource host:
+
+- **Initial grant response** (e.g. `authorization_code`): mint a unique placeholder pair, store a new vault row (real tokens + placeholders + token endpoint), and return the placeholders in the response body. The refresh-token field is replaced, not omitted, so a client that requested `offline_access` does not error on a missing token.
+- **Refresh request** (`grant_type=refresh_token`): match the vault row by the client's placeholder refresh token, swap in the real one, and forward upstream. A refresh whose token crinj does not recognize is passed through untouched.
+- **Refresh response:** rotate the real tokens in the matched row and return the same stable placeholders.
+- **Resource host:** match the vault row by the client's placeholder bearer and inject that row's real access token. The token is injected only when the placeholder belongs to the issuer governing this host, so a misdirected token is never sent to the wrong host.
+
+Token request and response bodies are parsed by `Content-Type`: `application/x-www-form-urlencoded` (the OAuth 2.0 default, used by most providers) or JSON. The body is re-serialized in its original format, so the swap is transparent to client and provider. A body that parses as neither is forwarded untouched.
+
+Refresh is reactive: the client's own refresh request drives the real upstream refresh, so there is no background refresher. There is no id_token / OIDC handling — any id_token in a response is passed through untouched. DPoP / sender-constrained tokens (RFC 9449) are out of scope; confirm a provider issues plain bearer tokens before configuring it.
+
+The vault is shared across connections, so a login captured on one connection authorizes API calls on another. It is persisted to a SQLite database at `<data-dir>/oauth.db` (mode 0600, one row per login keyed by the placeholder access token), written on every capture and restored at startup, so captured tokens survive a crinj restart: the client keeps using its placeholders and crinj still maps them to the real tokens, with no re-login. A real access token that expired while crinj was down is refreshed reactively on the client's next refresh request.
+
 ### Glob patterns
 
 `*` is the only metacharacter, matches any sequence of characters. Used in both domain and URL-path patterns.

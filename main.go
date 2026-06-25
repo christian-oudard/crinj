@@ -73,9 +73,26 @@ func main() {
 			"config", resolvedConfigPath)
 	}
 
+	oauthChains, err := loadOAuth(resolvedConfigPath)
+	if err != nil {
+		slog.Error("loading oauth config", "error", err)
+		os.Exit(1)
+	}
+	var oauthEngine *OAuthEngine
+	if len(oauthChains) > 0 {
+		vaultStore, err := OpenVaultStore(filepath.Join(resolvedDataDir, "oauth.db"))
+		if err != nil {
+			slog.Error("opening oauth vault store", "error", err)
+			os.Exit(1)
+		}
+		defer vaultStore.Close()
+		oauthEngine = NewOAuthEngine(oauthChains, vaultStore)
+		slog.Info("loaded oauth chains", "count", len(oauthChains))
+	}
+
 	slog.Info("ready", "port", *port, "bind", *bind)
 
-	server := NewGatewayServer(ca, uint16(*port), *bind, rules,
+	server := NewGatewayServer(ca, uint16(*port), *bind, rules, oauthEngine,
 		resolvedConfigPath, *allowEmptyRules, upstreamProxy)
 
 	ctx, stop := signal.NotifyContext(context.Background(),

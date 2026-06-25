@@ -1143,7 +1143,7 @@ func TestMITMInjectsHeaderEndToEnd(t *testing.T) {
 			return
 		}
 		// Upstream is httptest's self-signed cert; use the insecure config.
-		proxyDone <- mitm(c, target, ca, buildUpstreamTLSConfig(true), nil, nil, rules)
+		proxyDone <- mitm(c, target, ca, buildUpstreamTLSConfig(true), nil, nil, rules, nil)
 	}()
 
 	rawConn, err := net.Dial("tcp", proxyL.Addr().String())
@@ -1235,7 +1235,7 @@ func TestMITMBlockedResponseShortCircuits(t *testing.T) {
 		if err != nil {
 			return
 		}
-		_ = mitm(c, target, ca, buildUpstreamTLSConfig(true), nil, access, nil)
+		_ = mitm(c, target, ca, buildUpstreamTLSConfig(true), nil, access, nil, nil)
 	}()
 
 	rawConn, err := net.Dial("tcp", proxyL.Addr().String())

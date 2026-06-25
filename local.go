@@ -36,6 +36,16 @@ type tomlHostEntry struct {
 	Access             *string           `toml:"access"`
 	Source             *string           `toml:"source"`
 	Inject             []tomlInjectEntry `toml:"inject"`
+	OAuth              *tomlHostOAuth    `toml:"oauth"`
+}
+
+// tomlHostOAuth mirrors the [host.oauth] table. The [[host]] it sits under is
+// the resource host; the token endpoint (token-host/token-path) is
+// auto-intercepted. token-host defaults to the resource domain. A host family
+// that shares one login is a single wildcard domain. See SPEC.md.
+type tomlHostOAuth struct {
+	TokenHost *string `toml:"token-host"`
+	TokenPath *string `toml:"token-path"`
 }
 
 // tomlInjectEntry mirrors a single [[host.inject]] entry.
@@ -104,10 +114,77 @@ func load(path string) ([]ResolvedHost, error) {
 		}
 		return nil, fmt.Errorf("%s", sb.String())
 	}
+
+	// Auto-intercept the token endpoint of each [host.oauth]. Without a
+	// synthesized entry the token host would tunnel through unintercepted,
+	// carrying the real tokens. The resource host already has its own [[host]]
+	// (oauth is nested under it); only the token host can be implicit.
+	chains, err := parseOAuthChains(&cfg)
+	if err != nil {
+		return nil, fmt.Errorf("in %s: %w", path, err)
+	}
+	declared := make(map[string]bool, len(resolved))
+	for i := range resolved {
+		declared[resolved[i].HostPattern] = true
+	}
+	for _, ch := range chains {
+		if declared[ch.TokenHost] {
+			continue
+		}
+		declared[ch.TokenHost] = true
+		resolved = append(resolved, ResolvedHost{HostPattern: ch.TokenHost})
+	}
+
 	if err := validateHostSpecificity(resolved); err != nil {
 		return nil, err
 	}
 	return resolved, nil
+}
+
+// loadOAuth parses the [host.oauth] blocks into chains. Read separately from
+// load so the host rules can reload on SIGHUP without disturbing the live token
+// vault.
+func loadOAuth(path string) ([]OAuthChain, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading config file %s: %w", path, err)
+	}
+	var cfg tomlConfig
+	if err := toml.Unmarshal(content, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	chains, err := parseOAuthChains(&cfg)
+	if err != nil {
+		return nil, fmt.Errorf("in %s: %w", path, err)
+	}
+	return chains, nil
+}
+
+// parseOAuthChains turns each [host.oauth] block into one chain: the resource
+// host is the [[host]] it sits under, token-host defaults to that domain, and
+// token-path is required.
+func parseOAuthChains(cfg *tomlConfig) ([]OAuthChain, error) {
+	var chains []OAuthChain
+	for i := range cfg.Host {
+		entry := &cfg.Host[i]
+		o := entry.OAuth
+		if o == nil {
+			continue
+		}
+		if o.TokenPath == nil {
+			return nil, fmt.Errorf("host %q: [host.oauth] requires token-path", entry.Domain)
+		}
+		tokenHost := entry.Domain
+		if o.TokenHost != nil {
+			tokenHost = *o.TokenHost
+		}
+		chains = append(chains, OAuthChain{
+			TokenHost: tokenHost,
+			TokenPath: *o.TokenPath,
+			Resource:  entry.Domain,
+		})
+	}
+	return chains, nil
 }
 
 // resolveHost builds a fully resolved host. Any failure causes the caller to

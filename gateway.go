@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -160,6 +161,11 @@ type GatewayServer struct {
 	configPath      string
 	allowEmptyRules bool
 
+	// oauth brokers token flows, backed by the persistent vault. It is shared
+	// across every connection and, unlike rules, is not rebuilt on SIGHUP. nil
+	// when no [host.oauth] is configured.
+	oauth *OAuthEngine
+
 	bindAddr string
 	port     uint16
 }
@@ -169,7 +175,7 @@ type GatewayServer struct {
 // GATEWAY_DANGER_ACCEPT_INVALID_CERTS is set) and an always-insecure one for
 // hosts marked no-check-certificate.
 func NewGatewayServer(ca *CertificateAuthority, port uint16, bindAddr string,
-	rules []ResolvedHost, configPath string, allowEmptyRules bool,
+	rules []ResolvedHost, oauth *OAuthEngine, configPath string, allowEmptyRules bool,
 	upstreamProxy *UpstreamProxy) *GatewayServer {
 
 	danger := os.Getenv("GATEWAY_DANGER_ACCEPT_INVALID_CERTS") != ""
@@ -179,6 +185,7 @@ func NewGatewayServer(ca *CertificateAuthority, port uint16, bindAddr string,
 		upstreamTLSNoCheck: buildUpstreamTLSConfig(true),
 		upstreamProxy:      upstreamProxy,
 		rules:              rules,
+		oauth:              oauth,
 		configPath:         configPath,
 		allowEmptyRules:    allowEmptyRules,
 		bindAddr:           bindAddr,
@@ -300,7 +307,7 @@ func (s *GatewayServer) handleConnect(clientConn net.Conn, br *bufio.Reader, req
 	// the Rust original; match that.
 	if resolved.Intercept {
 		if err := mitm(client, host, s.ca, upstreamTLS, s.upstreamProxy,
-			resolved.Access, resolved.InjectionRules); err != nil {
+			resolved.Access, resolved.InjectionRules, s.oauth); err != nil {
 			slog.Debug("connection error", "host", host, "error", err)
 		}
 		return
@@ -372,6 +379,7 @@ func mitm(
 	upstreamProxy *UpstreamProxy,
 	access []AccessEntry,
 	rules []InjectionRule,
+	oauth *OAuthEngine,
 ) error {
 	hostname := stripPort(host)
 
@@ -432,6 +440,15 @@ func mitm(
 			continue
 		}
 
+		// OAuth: on the resource host swap the placeholder bearer for the real
+		// access token; on the token endpoint rewrite the placeholder refresh
+		// token and return an exchange so the response can be captured.
+		exchange, err := applyOAuthRequest(req, hostname, oauth)
+		if err != nil {
+			slog.Warn("oauth request error", "host", host, "error", err)
+			return err
+		}
+
 		if err := req.Write(tlsUpstream); err != nil {
 			return fmt.Errorf("forwarding to %s: %w", host, err)
 		}
@@ -442,6 +459,15 @@ func mitm(
 		}
 
 		resp.Header = filterHeaders(resp.Header)
+
+		// OAuth token endpoint: capture the real tokens into the vault and
+		// return placeholders to the client.
+		if exchange != nil {
+			if err := captureOAuthResponse(resp, exchange, oauth); err != nil {
+				_ = resp.Body.Close()
+				return err
+			}
+		}
 
 		writeErr := resp.Write(tlsClient)
 		_ = resp.Body.Close()
@@ -467,11 +493,11 @@ func mitm(
 func writeSyntheticBlocked(w io.Writer) error {
 	body := "{}"
 	resp := &http.Response{
-		StatusCode: http.StatusOK,
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(body)),
+		StatusCode:    http.StatusOK,
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          io.NopCloser(strings.NewReader(body)),
 		ContentLength: int64(len(body)),
 	}
 	return resp.Write(w)
@@ -516,6 +542,100 @@ func prepareUpstreamRequest(req *http.Request, access []AccessEntry, rules []Inj
 	req.RequestURI = ""
 
 	return false, headerCount + queryCount, nil
+}
+
+// applyOAuthRequest applies the request side of OAuth passthrough to a request
+// already prepared for the upstream (headers filtered, URI path-only). On a
+// resource host it swaps the client's placeholder bearer for the real access
+// token. On the token endpoint it buffers the body and swaps the placeholder
+// refresh token for the real one, returning an exchange so the response can be
+// captured. Returns nil when there is nothing to capture on the response.
+func applyOAuthRequest(req *http.Request, hostname string, oauth *OAuthEngine) (*tokenExchange, error) {
+	if oauth == nil {
+		return nil, nil
+	}
+
+	if endpoint, ok := oauth.resourceEndpoint(hostname); ok {
+		if auth := req.Header.Get("Authorization"); auth != "" {
+			bearer, ok, err := oauth.resourceBearer(endpoint, auth)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				req.Header.Set("Authorization", bearer)
+			}
+		}
+	}
+
+	endpoint, ok := oauth.tokenEndpoint(hostname, req.URL.Path)
+	if !ok {
+		return nil, nil
+	}
+	body, err := io.ReadAll(req.Body)
+	_ = req.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("reading token request body: %w", err)
+	}
+	out := body
+	var exchange *tokenExchange
+	if tb, ok := parseTokenBody(req.Header.Get("Content-Type"), body); ok {
+		ex, changed, err := oauth.beginTokenRequest(endpoint, tb)
+		if err != nil {
+			return nil, err
+		}
+		exchange = ex
+		if changed {
+			out = tb.toBytes()
+		}
+	}
+	setRequestBody(req, out)
+	return exchange, nil
+}
+
+// captureOAuthResponse handles the token-endpoint response: on a successful
+// status it captures the real tokens into the vault and rewrites the body to
+// the client's placeholders. Always buffers and replaces the body so the
+// Content-Length is exact.
+func captureOAuthResponse(resp *http.Response, exchange *tokenExchange, oauth *OAuthEngine) error {
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		return fmt.Errorf("reading token response body: %w", err)
+	}
+	out := body
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if tb, ok := parseTokenBody(resp.Header.Get("Content-Type"), body); ok {
+			changed, err := oauth.completeResponse(exchange, tb)
+			if err != nil {
+				return err
+			}
+			if changed {
+				out = tb.toBytes()
+			}
+		} else {
+			slog.Warn("oauth: token response body unparsable; passed through uncaptured")
+		}
+	}
+	setResponseBody(resp, out)
+	return nil
+}
+
+// setRequestBody replaces a request's body with a fixed byte slice, fixing up
+// the length fields so http.Request.Write emits an exact Content-Length and no
+// chunked transfer encoding.
+func setRequestBody(req *http.Request, body []byte) {
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.TransferEncoding = nil
+	req.Header.Del("Content-Length")
+}
+
+// setResponseBody is the response-side counterpart of setRequestBody.
+func setResponseBody(resp *http.Response, body []byte) {
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.TransferEncoding = nil
+	resp.Header.Del("Content-Length")
 }
 
 // buildUpstreamTLSConfig returns a *tls.Config used when crinj acts as a TLS
