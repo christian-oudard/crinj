@@ -26,7 +26,7 @@ import (
 type OAuthChain struct {
 	TokenHost string
 	TokenPath string
-	Resource  string
+	Resource  []string
 }
 
 // endpoint is the token-endpoint identity, used to scope which resource hosts a
@@ -46,7 +46,12 @@ func (c OAuthChain) isTokenEndpoint(host, path string) bool {
 // matchesResource reports whether host is this chain's resource host. The
 // pattern may be a wildcard (*.googleapis.com), matched like a [[host]] domain.
 func (c OAuthChain) matchesResource(host string) bool {
-	return globMatches(host, c.Resource)
+	for _, pattern := range c.Resource {
+		if globMatches(host, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // mintFake mints a placeholder that mimics the real token's prefix — so a

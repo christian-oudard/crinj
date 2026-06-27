@@ -9,7 +9,7 @@ func testChain() OAuthChain {
 	return OAuthChain{
 		TokenHost: "platform.claude.com",
 		TokenPath: "/v1/oauth/token",
-		Resource:  "api.anthropic.com",
+		Resource:  []string{"api.anthropic.com"},
 	}
 }
 
@@ -270,7 +270,7 @@ func TestIsTokenEndpointMatchesHostAndPath(t *testing.T) {
 }
 
 func TestMatchesResourceWildcard(t *testing.T) {
-	c := OAuthChain{Resource: "*.googleapis.com"}
+	c := OAuthChain{Resource: []string{"*.googleapis.com"}}
 	if !c.matchesResource("gmail.googleapis.com") {
 		t.Error("wildcard should match family member")
 	}

@@ -31,7 +31,7 @@ format = "Bearer {}"
 
 Canonical field order:
 
-1. `domain` — match pattern (required)
+1. `domain` — match pattern, or list of patterns (required). A scalar string or a TOML array. Multiple patterns in one block share all other fields (access, inject, oauth). Use this when disjoint domains share one OAuth login and cannot be covered by a single wildcard.
 2. `no-check-certificate` — skip upstream TLS verification (bool, default false)
 3. `access` — access control list (multiline string, optional)
 4. `source` — host-level default source, inherited by inject entries (optional; omit when only one inject entry uses it)
@@ -102,7 +102,7 @@ token-path = "/v1/oauth/token"
 
 The token host is **auto-intercepted** — crinj synthesizes an interception entry for it, so it needs no `[[host]]` of its own (the resource host already has one).
 
-A host family that shares one login (one token authorizes a whole API family, e.g. Google's `*.googleapis.com`) is a single wildcard resource host, so the endpoint is stated once with no repetition:
+A host family that shares one login (one token authorizes a whole API family, e.g. Google's `*.googleapis.com`) can be a single wildcard resource host, or a `domain` list when the domains are disjoint and cannot be covered by a wildcard. Either way the endpoint is stated once with no repetition:
 
 ```toml
 [[host]]

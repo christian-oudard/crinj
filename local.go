@@ -31,13 +31,43 @@ type tomlConfig struct {
 //
 // Canonical field order: domain, no-check-certificate, access, source, inject.
 type tomlHostEntry struct {
-	Domain             string            `toml:"domain"`
+	Domain             Domains           `toml:"domain"`
 	NoCheckCertificate bool              `toml:"no-check-certificate"`
 	Access             *string           `toml:"access"`
 	Source             *string           `toml:"source"`
 	Inject             []tomlInjectEntry `toml:"inject"`
 	OAuth              *tomlHostOAuth    `toml:"oauth"`
 }
+
+// Domains is the `domain` field: one host pattern or a list of patterns handled
+// by the same entry (like nginx `server_name a b c;`). A multi-pattern entry
+// expands to one resolved host per pattern, so a provider whose surface spans
+// disjoint domains needs only one [[host]] block.
+type Domains []string
+
+// UnmarshalTOML accepts either a bare string or an array of strings.
+func (d *Domains) UnmarshalTOML(v interface{}) error {
+	switch val := v.(type) {
+	case string:
+		*d = Domains{val}
+	case []interface{}:
+		out := make(Domains, 0, len(val))
+		for _, item := range val {
+			s, ok := item.(string)
+			if !ok {
+				return fmt.Errorf("domain list entries must be strings, got %T", item)
+			}
+			out = append(out, s)
+		}
+		*d = out
+	default:
+		return fmt.Errorf("domain must be a string or a list of strings, got %T", v)
+	}
+	return nil
+}
+
+// label renders the patterns for error messages.
+func (d Domains) label() string { return strings.Join(d, ", ") }
 
 // tomlHostOAuth mirrors the [host.oauth] table. The [[host]] it sits under is
 // the resource host; the token endpoint (token-host/token-path) is
@@ -94,17 +124,28 @@ func load(path string) ([]ResolvedHost, error) {
 	resolved := make([]ResolvedHost, 0, len(cfg.Host))
 	var fatal []error
 	for i := range cfg.Host {
-		h, err := resolveHost(&cfg.Host[i], path)
+		entry := &cfg.Host[i]
+		if len(entry.Domain) == 0 {
+			fatal = append(fatal, fmt.Errorf("host entry %d has no domain", i+1))
+			continue
+		}
+		h, err := resolveHost(entry, path)
 		if err != nil {
 			if isSecretUnavailable(err) {
 				slog.Warn("skipping host: secret not available",
-					"domain", cfg.Host[i].Domain, "error", err)
+					"domain", entry.Domain.label(), "error", err)
 				continue
 			}
 			fatal = append(fatal, err)
 			continue
 		}
-		resolved = append(resolved, *h)
+		// Expand a multi-domain entry into one resolved host per pattern so
+		// matching, specificity, and duplicate detection stay per-pattern.
+		for _, pattern := range entry.Domain {
+			rh := *h
+			rh.HostPattern = pattern
+			resolved = append(resolved, rh)
+		}
 	}
 	if len(fatal) > 0 {
 		var sb strings.Builder
@@ -172,16 +213,23 @@ func parseOAuthChains(cfg *tomlConfig) ([]OAuthChain, error) {
 			continue
 		}
 		if o.TokenPath == nil {
-			return nil, fmt.Errorf("host %q: [host.oauth] requires token-path", entry.Domain)
+			return nil, fmt.Errorf("host %q: [host.oauth] requires token-path", entry.Domain.label())
 		}
-		tokenHost := entry.Domain
-		if o.TokenHost != nil {
+		var tokenHost string
+		switch {
+		case o.TokenHost != nil:
 			tokenHost = *o.TokenHost
+		case len(entry.Domain) == 1:
+			tokenHost = entry.Domain[0]
+		default:
+			return nil, fmt.Errorf(
+				"host %q: [host.oauth] spanning multiple domains must set token-host",
+				entry.Domain.label())
 		}
 		chains = append(chains, OAuthChain{
 			TokenHost: tokenHost,
 			TokenPath: *o.TokenPath,
-			Resource:  entry.Domain,
+			Resource:  []string(entry.Domain),
 		})
 	}
 	return chains, nil
@@ -195,7 +243,7 @@ func resolveHost(entry *tomlHostEntry, configPath string) (*ResolvedHost, error)
 	if entry.Access != nil {
 		a, err := parseAccess(*entry.Access)
 		if err != nil {
-			return nil, fmt.Errorf("host %q in %s: %w", entry.Domain, configPath, err)
+			return nil, fmt.Errorf("host %q in %s: %w", entry.Domain.label(), configPath, err)
 		}
 		access = a
 	}
@@ -203,8 +251,9 @@ func resolveHost(entry *tomlHostEntry, configPath string) (*ResolvedHost, error)
 	if err != nil {
 		return nil, err
 	}
+	// HostPattern is filled in per pattern by the caller (load expands a
+	// multi-domain entry into one resolved host per pattern).
 	return &ResolvedHost{
-		HostPattern:        entry.Domain,
 		NoCheckCertificate: entry.NoCheckCertificate,
 		Access:             access,
 		InjectionRules:     rules,
@@ -215,7 +264,7 @@ func resolveHostInjects(entry *tomlHostEntry, configPath string) ([]InjectionRul
 	rules := make([]InjectionRule, 0, len(entry.Inject))
 	for i := range entry.Inject {
 		ie := &entry.Inject[i]
-		injection, err := resolveInjection(ie, entry.Source, entry.Domain, configPath)
+		injection, err := resolveInjection(ie, entry.Source, entry.Domain.label(), configPath)
 		if err != nil {
 			return nil, err
 		}

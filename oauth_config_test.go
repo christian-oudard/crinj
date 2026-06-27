@@ -20,21 +20,21 @@ func chainsFor(t *testing.T, hosts ...tomlHostEntry) []OAuthChain {
 
 func TestOAuthConfigSingleHost(t *testing.T) {
 	chains := chainsFor(t, tomlHostEntry{
-		Domain: "api.anthropic.com",
+		Domain: Domains{"api.anthropic.com"},
 		OAuth:  &tomlHostOAuth{TokenHost: sp("platform.claude.com"), TokenPath: sp("/v1/oauth/token")},
 	})
 	if len(chains) != 1 {
 		t.Fatalf("got %d chains", len(chains))
 	}
 	c := chains[0]
-	if c.TokenHost != "platform.claude.com" || c.TokenPath != "/v1/oauth/token" || c.Resource != "api.anthropic.com" {
+	if c.TokenHost != "platform.claude.com" || c.TokenPath != "/v1/oauth/token" || len(c.Resource) != 1 || c.Resource[0] != "api.anthropic.com" {
 		t.Fatalf("chain = %+v", c)
 	}
 }
 
 func TestOAuthConfigTokenHostDefaultsToDomain(t *testing.T) {
 	chains := chainsFor(t, tomlHostEntry{
-		Domain: "idp.example.com",
+		Domain: Domains{"idp.example.com"},
 		OAuth:  &tomlHostOAuth{TokenPath: sp("/token")},
 	})
 	if chains[0].TokenHost != "idp.example.com" {
@@ -44,11 +44,11 @@ func TestOAuthConfigTokenHostDefaultsToDomain(t *testing.T) {
 
 func TestOAuthConfigWildcardResource(t *testing.T) {
 	chains := chainsFor(t, tomlHostEntry{
-		Domain: "*.googleapis.com",
+		Domain: Domains{"*.googleapis.com"},
 		OAuth:  &tomlHostOAuth{TokenHost: sp("oauth2.googleapis.com"), TokenPath: sp("/token")},
 	})
-	if chains[0].Resource != "*.googleapis.com" {
-		t.Errorf("resource = %q, want wildcard", chains[0].Resource)
+	if len(chains[0].Resource) != 1 || chains[0].Resource[0] != "*.googleapis.com" {
+		t.Errorf("resource = %v, want wildcard", chains[0].Resource)
 	}
 	if !chains[0].matchesResource("sheets.googleapis.com") {
 		t.Error("wildcard chain should cover family members")
@@ -57,7 +57,7 @@ func TestOAuthConfigWildcardResource(t *testing.T) {
 
 func TestOAuthConfigMissingTokenPath(t *testing.T) {
 	_, err := parseOAuthChains(&tomlConfig{Host: []tomlHostEntry{
-		{Domain: "a.example.com", OAuth: &tomlHostOAuth{TokenHost: sp("idp")}},
+		{Domain: Domains{"a.example.com"}, OAuth: &tomlHostOAuth{TokenHost: sp("idp")}},
 	}})
 	if err == nil || !strings.Contains(err.Error(), "requires token-path") {
 		t.Fatalf("expected missing token-path error, got %v", err)
