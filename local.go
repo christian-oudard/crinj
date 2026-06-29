@@ -118,8 +118,18 @@ func load(path string) ([]ResolvedHost, error) {
 		return nil, fmt.Errorf("reading config file %s: %w", path, err)
 	}
 	var cfg tomlConfig
-	if err := toml.Unmarshal(content, &cfg); err != nil {
+	md, err := toml.Decode(string(content), &cfg)
+	if err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	// Reject typos and unsupported blocks rather than silently dropping them.
+	if undecoded := md.Undecoded(); len(undecoded) > 0 {
+		keys := make([]string, len(undecoded))
+		for i, k := range undecoded {
+			keys[i] = k.String()
+		}
+		return nil, fmt.Errorf("unknown field(s) in %s: %s",
+			path, strings.Join(keys, ", "))
 	}
 	resolved := make([]ResolvedHost, 0, len(cfg.Host))
 	var fatal []error

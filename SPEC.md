@@ -12,7 +12,7 @@ A local MITM proxy for sandboxing tools (typically AI agents) that need API acce
 
 ## Config
 
-TOML. A config is a list of host entries.
+TOML. A config is a list of host entries. Unknown fields (a typo or an unsupported block) fail config load naming the offending field, rather than being silently ignored.
 
 ```toml
 [[host]]

@@ -275,6 +275,20 @@ value = "second"
 	}
 }
 
+func TestLoadRejectsUnknownField(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "rules.toml")
+	writeFile(t, cfg, `
+[[host]]
+domain = "api.anthropic.com"
+acccess = "block *"
+`)
+	_, err := load(cfg)
+	if err == nil || !strings.Contains(err.Error(), "acccess") {
+		t.Errorf("want unknown-field error naming acccess, got %v", err)
+	}
+}
+
 func TestLoadSingleRuleHeader(t *testing.T) {
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "rules.toml")
