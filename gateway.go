@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -595,10 +596,10 @@ func applyOAuthRequest(req *http.Request, hostname string, oauth *OAuthEngine) (
 // captureOAuthResponse handles the token-endpoint response: on a successful
 // status it captures the real tokens into the vault and rewrites the body to
 // the client's placeholders. Always buffers and replaces the body so the
-// Content-Length is exact.
+// Content-Length is exact. Decompresses gzip-encoded bodies transparently
+// (http.ReadResponse does not auto-decompress, unlike http.Client).
 func captureOAuthResponse(resp *http.Response, exchange *tokenExchange, oauth *OAuthEngine) error {
-	body, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
+	body, err := readMaybeGzip(resp)
 	if err != nil {
 		return fmt.Errorf("reading token response body: %w", err)
 	}
@@ -613,11 +614,43 @@ func captureOAuthResponse(resp *http.Response, exchange *tokenExchange, oauth *O
 				out = tb.toBytes()
 			}
 		} else {
-			slog.Warn("oauth: token response body unparsable; passed through uncaptured")
+			slog.Warn("oauth: token response body unparsable; passed through uncaptured",
+				"content_type", resp.Header.Get("Content-Type"),
+				"body_prefix", truncate(body, 100))
 		}
 	}
 	setResponseBody(resp, out)
 	return nil
+}
+
+// readMaybeGzip reads and fully buffers resp.Body. If the response carries
+// Content-Encoding: gzip it decompresses on the fly and strips that header so
+// the caller (and the downstream client) see plain bytes. http.ReadResponse
+// does not auto-decompress, so without this gzip bodies arrive as opaque
+// binary and cannot be parsed as JSON/form.
+func readMaybeGzip(resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	if !strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		return io.ReadAll(resp.Body)
+	}
+	gr, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("opening gzip reader: %w", err)
+	}
+	defer gr.Close()
+	body, err := io.ReadAll(gr)
+	if err != nil {
+		return nil, err
+	}
+	resp.Header.Del("Content-Encoding")
+	return body, nil
+}
+
+func truncate(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + "…"
 }
 
 // setRequestBody replaces a request's body with a fixed byte slice, fixing up
