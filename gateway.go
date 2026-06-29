@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,6 +18,14 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
+)
+
+const (
+	dialTimeout     = 30 * time.Second
+	handshakeTimeout = 15 * time.Second
+	idleTimeout     = 5 * time.Minute
+	keepAlivePeriod = 30 * time.Second
 )
 
 // HTTP gateway server: connection handling, MITM interception, and tunneling.
@@ -232,6 +241,10 @@ func (s *GatewayServer) Run(ctx context.Context) error {
 			}
 			return fmt.Errorf("accept: %w", err)
 		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetKeepAlive(true)
+			tc.SetKeepAlivePeriod(keepAlivePeriod)
+		}
 		go s.handleConnection(conn)
 	}
 }
@@ -388,10 +401,12 @@ func mitm(
 	if err != nil {
 		return fmt.Errorf("issuing leaf cert for %s: %w", hostname, err)
 	}
+	_ = clientConn.SetDeadline(time.Now().Add(handshakeTimeout))
 	tlsClient := tls.Server(clientConn, leafCfg)
 	if err := tlsClient.Handshake(); err != nil {
 		return fmt.Errorf("client TLS handshake: %w", err)
 	}
+	_ = tlsClient.SetDeadline(time.Time{})
 	defer tlsClient.Close()
 
 	target := host
@@ -405,20 +420,24 @@ func mitm(
 	upstreamCfg := upstreamTLS.Clone()
 	upstreamCfg.ServerName = hostname
 	upstreamCfg.NextProtos = []string{"http/1.1"}
+	_ = upstreamRaw.SetDeadline(time.Now().Add(handshakeTimeout))
 	tlsUpstream := tls.Client(upstreamRaw, upstreamCfg)
 	if err := tlsUpstream.Handshake(); err != nil {
 		upstreamRaw.Close()
 		return fmt.Errorf("upstream TLS handshake with %s: %w", host, err)
 	}
+	_ = tlsUpstream.SetDeadline(time.Time{})
 	defer tlsUpstream.Close()
 
 	clientReader := bufio.NewReader(tlsClient)
 	upstreamReader := bufio.NewReader(tlsUpstream)
 
 	for {
+		_ = tlsClient.SetReadDeadline(time.Now().Add(idleTimeout))
 		req, err := http.ReadRequest(clientReader)
+		_ = tlsClient.SetReadDeadline(time.Time{})
 		if err != nil {
-			if err == io.EOF {
+			if err == io.EOF || isIdleTimeout(err) {
 				return nil
 			}
 			return fmt.Errorf("reading client request: %w", err)
@@ -735,11 +754,19 @@ func closeWrite(c net.Conn) {
 // dialUpstream opens a TCP connection to target ("host:port"), routing
 // through the upstream proxy if one is configured and the host is not in
 // NO_PROXY.
+// isIdleTimeout reports whether err is a network timeout on an idle connection
+// (no request arrived within idleTimeout). These are normal and should be
+// treated as a clean close, not an error worth logging.
+func isIdleTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 func dialUpstream(target string, proxy *UpstreamProxy) (net.Conn, error) {
 	if proxy != nil && proxy.appliesTo(stripPort(target)) {
 		return dialViaProxy(proxy.addr, target)
 	}
-	conn, err := net.Dial("tcp", target)
+	conn, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to %s: %w", target, err)
 	}
@@ -750,7 +777,7 @@ func dialUpstream(target string, proxy *UpstreamProxy) (net.Conn, error) {
 // target. Returns the still-open TCP connection on a 200 response, ready for
 // the caller to layer TLS or raw bytes on top.
 func dialViaProxy(proxyAddr, target string) (net.Conn, error) {
-	conn, err := net.Dial("tcp", proxyAddr)
+	conn, err := net.DialTimeout("tcp", proxyAddr, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to upstream proxy %s: %w", proxyAddr, err)
 	}
