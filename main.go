@@ -95,14 +95,21 @@ func main() {
 	server := NewGatewayServer(ca, uint16(*port), *bind, rules, oauthEngine,
 		resolvedConfigPath, *allowEmptyRules, upstreamProxy)
 
-	ctx, stop := signal.NotifyContext(context.Background(),
-		syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		sig := <-sigCh
+		slog.Warn("received signal, shutting down", "signal", sig.String())
+		cancel()
+	}()
 
 	if err := server.Run(ctx); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
+	slog.Info("crinj stopped")
 }
 
 // setupLogging configures slog for the requested format and routes the
