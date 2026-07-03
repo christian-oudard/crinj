@@ -194,6 +194,7 @@ Secret files must have mode 0o600 (no group/world access) or crinj refuses to st
 - Generates and persists a CA cert at first startup. The tool must trust this CA to avoid TLS errors.
 - `SIGHUP` reloads config without restart. If the new config has no host entries, the reload is rejected unless crinj was started with `--allow-empty-rules`.
 - `--log-file` writes structured logs to a file.
+- Losing the log consumer never kills the proxy: if stderr is a pipe whose reader has exited, log writes are dropped and crinj keeps serving.
 
 ## Non-goals
 

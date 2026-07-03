@@ -19,6 +19,7 @@ import (
 // the CA + config, and runs the gateway server until SIGINT/SIGTERM.
 
 func main() {
+	ignoreSIGPIPE()
 	port := flag.Uint("port", 10255, "Port to listen on")
 	bind := flag.String("bind", "127.0.0.1", "Address to bind to")
 	dataDir := flag.String("data-dir", "", "Data directory for CA certificates")
@@ -110,6 +111,15 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("crinj stopped")
+}
+
+// ignoreSIGPIPE keeps crinj alive when its log consumer disappears. crinj
+// logs to stderr, typically a pipe held by the process that spawned it, and
+// crinj outlives that process by design. Go's runtime escalates EPIPE on
+// stderr to a fatal SIGPIPE, so without this the first log line written
+// after the spawner exits kills the proxy.
+func ignoreSIGPIPE() {
+	signal.Ignore(syscall.SIGPIPE)
 }
 
 // setupLogging configures slog for the requested format and routes the

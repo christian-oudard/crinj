@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -164,5 +165,38 @@ func TestGatewayServerRunReturnsBindError(t *testing.T) {
 	err = srv.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "binding") {
 		t.Errorf("want bind error, got %v", err)
+	}
+}
+
+// ── SIGPIPE resilience ─────────────────────────────────────────────────
+
+// crinj outlives the process that spawned it, so its stderr pipe can lose
+// its reader mid-run. Go's runtime turns EPIPE on stderr into a fatal
+// SIGPIPE by default; crinj must survive that and keep proxying.
+// Re-executes the test binary as a child that logs to a stderr pipe whose
+// read end the parent has closed.
+func TestStderrPipeCloseDoesNotKill(t *testing.T) {
+	if os.Getenv("CRINJ_SIGPIPE_CHILD") == "1" {
+		ignoreSIGPIPE()
+		time.Sleep(200 * time.Millisecond)
+		for range 10 {
+			os.Stderr.WriteString("log line after reader vanished\n")
+		}
+		os.Exit(0)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=TestStderrPipeCloseDoesNotKill")
+	cmd.Env = append(os.Environ(), "CRINJ_SIGPIPE_CHILD=1")
+	cmd.Stderr = w
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	r.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("child died writing to closed stderr pipe: %v", err)
 	}
 }
