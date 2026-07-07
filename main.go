@@ -88,7 +88,7 @@ func main() {
 		}
 		defer vaultStore.Close()
 		oauthEngine = NewOAuthEngine(oauthChains, vaultStore)
-		slog.Info("loaded oauth chains", "count", len(oauthChains))
+		slog.Info("loaded token broker chains (oauth/jwt)", "count", len(oauthChains))
 	}
 
 	slog.Info("ready", "port", *port, "bind", *bind)

@@ -11,7 +11,7 @@ func sp(s string) *string { return &s }
 
 func chainsFor(t *testing.T, hosts ...tomlHostEntry) []OAuthChain {
 	t.Helper()
-	chains, err := parseOAuthChains(&tomlConfig{Host: hosts})
+	chains, err := parseOAuthChains(&tomlConfig{Host: hosts}, "")
 	if err != nil {
 		t.Fatalf("parseOAuthChains: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestOAuthConfigWildcardResource(t *testing.T) {
 func TestOAuthConfigMissingTokenPath(t *testing.T) {
 	_, err := parseOAuthChains(&tomlConfig{Host: []tomlHostEntry{
 		{Domain: Domains{"a.example.com"}, OAuth: &tomlHostOAuth{TokenHost: sp("idp")}},
-	}})
+	}}, "")
 	if err == nil || !strings.Contains(err.Error(), "requires token-path") {
 		t.Fatalf("expected missing token-path error, got %v", err)
 	}

@@ -51,6 +51,20 @@ func TestVaultStoreGetByRefresh(t *testing.T) {
 	}
 }
 
+func TestVaultStoreGetByIdentity(t *testing.T) {
+	store := openTestStore(t)
+	row := tokenRow{IssuedAccess: "AT", RealAccess: "real", Endpoint: "e", Identity: "e\x00iss\x00\x00scope"}
+	store.Upsert(row)
+	got, ok, err := store.GetByIdentity("e\x00iss\x00\x00scope")
+	if err != nil || !ok || got.IssuedAccess != "AT" {
+		t.Fatalf("GetByIdentity: ok=%v err=%v %+v", ok, err, got)
+	}
+	// empty identity never matches (OAuth rows store "")
+	if _, ok, _ := store.GetByIdentity(""); ok {
+		t.Error("empty identity should not match")
+	}
+}
+
 func TestVaultStoreGetMissing(t *testing.T) {
 	store := openTestStore(t)
 	if _, ok, err := store.GetByAccess("nope"); ok || err != nil {

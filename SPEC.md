@@ -127,6 +127,37 @@ Refresh is reactive: the client's own refresh request drives the real upstream r
 
 The vault is shared across connections, so a login captured on one connection authorizes API calls on another. It is persisted to a SQLite database at `<data-dir>/oauth.db` (mode 0600, one row per login keyed by the placeholder access token), written on every capture and restored at startup, so captured tokens survive a crinj restart: the client keeps using its placeholders and crinj still maps them to the real tokens, with no re-login. A real access token that expired while crinj was down is refreshed reactively on the client's next refresh request.
 
+### JWT-bearer signing
+
+For a service account (RFC 7523 jwt-bearer, e.g. a Google service-account key), the client authenticates by signing a short-lived assertion with a private key, not by sending a bearer secret. There is no static value in the request to swap, only a per-request signature, so brokering by substitution cannot work. Instead crinj holds the real key and **signs** the assertion. The sandboxed client holds only a throwaway key: it can assemble a well-formed request, but its assertion grants nothing until crinj replaces it.
+
+JWT is configured with a `[host.jwt]` table under the resource `[[host]]`, parallel to `[host.oauth]`. The token host is auto-intercepted the same way. A host may not declare both `[host.oauth]` and `[host.jwt]`.
+
+```toml
+[[host]]
+domain = "*.googleapis.com"
+[host.jwt]
+token-host = "oauth2.googleapis.com"   # defaults to the resource domain
+token-path = "/token"
+key = "sa-key.pem"                      # source path to the real private key (PKCS#1 or PKCS#8 PEM)
+issuer = "svc@proj.iam.gserviceaccount.com"
+scope = "https://www.googleapis.com/auth/logging.read"
+# audience defaults to https://<token-host><token-path>
+# alg defaults to RS256 (RS256/RS384/RS512 supported)
+# kid optional (JWS header; set to the key's private_key_id so Google selects the cert)
+# sub optional; setting it opts into domain-wide-delegation impersonation
+```
+
+The claims crinj puts in the assertion (`iss`, `scope`, optional `sub`, `aud`, `iat`, `exp`) are fixed by config, not copied from the client's assertion, so a sandboxed client cannot widen its own scope or impersonate a subject. `iat`/`exp` come from crinj's clock with a one-hour lifetime (Google's cap). The key is read at startup from a source file (mode 0600, like any secret); an absent key skips the block with a warning rather than failing the load.
+
+The flow reuses the OAuth machinery. At the token endpoint:
+
+- **jwt-bearer request** (`grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`): crinj reads the (unverified) `iss` from the client's assertion to route to the matching signer, then replaces the assertion with one it signs from the fixed claims. A jwt-bearer request whose issuer matches no configured signer is passed through untouched.
+- **response:** captures the real access token and returns a placeholder, exactly as an OAuth initial grant does. jwt-bearer returns no refresh token; renewal is the client re-signing and re-exchanging, which crinj re-signs again.
+- **resource host:** the placeholder bearer is swapped for the real access token, identical to OAuth.
+
+Because there is no refresh token to key renewals by, a jwt-bearer login is keyed in the vault by its authority (token endpoint plus the fixed claims), so a renewal rotates the existing row under one stable placeholder instead of accumulating rows. The vault is the same `oauth.db`; a service-account access token is an OAuth token regardless of how it was obtained.
+
 ### Glob patterns
 
 `*` is the only metacharacter, matches any sequence of characters. Used in both domain and URL-path patterns.

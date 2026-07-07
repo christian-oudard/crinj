@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // OAuth passthrough: broker a provider's token flow so a sandboxed client never
@@ -27,6 +28,12 @@ type OAuthChain struct {
 	TokenHost string
 	TokenPath string
 	Resource  []string
+
+	// Signer is non-nil for a [host.jwt] chain: instead of swapping a stored
+	// refresh token, crinj signs a fresh service-account assertion at the token
+	// endpoint. Everything downstream (capture, vault, resource-bearer
+	// injection) is shared with the OAuth path.
+	Signer *JWTSigner
 }
 
 // endpoint is the token-endpoint identity, used to scope which resource hosts a
@@ -256,11 +263,28 @@ func hexVal(b byte) (byte, bool) {
 type OAuthEngine struct {
 	chains []OAuthChain
 	store  *VaultStore
+	// now supplies the clock for jwt-bearer assertion iat/exp. A field so tests
+	// can pin it; defaults to time.Now.
+	now func() time.Time
 }
 
 // NewOAuthEngine returns an engine over the chains and vault store.
 func NewOAuthEngine(chains []OAuthChain, store *VaultStore) *OAuthEngine {
-	return &OAuthEngine{chains: chains, store: store}
+	return &OAuthEngine{chains: chains, store: store, now: time.Now}
+}
+
+// findSigner returns the signer for a jwt-bearer request, matched by both the
+// token endpoint and the issuer claimed in the client's assertion. The issuer
+// match is what keeps crinj from signing for an issuer it was not configured
+// to broker, and disambiguates when several keys share one token endpoint.
+func (e *OAuthEngine) findSigner(endpoint, issuer string) *JWTSigner {
+	for i := range e.chains {
+		c := &e.chains[i]
+		if c.Signer != nil && c.endpoint() == endpoint && c.Signer.Issuer == issuer {
+			return c.Signer
+		}
+	}
+	return nil
 }
 
 // tokenEndpoint returns the endpoint identity if (host, path) is a token
@@ -292,16 +316,24 @@ type tokenExchange struct {
 	endpoint string
 	newLogin bool
 	refresh  *tokenRow
+	// jwtIdentity is set for a jwt-bearer exchange; the response captures the
+	// real access token into the row keyed by this identity (reusing it across
+	// renewals), and no refresh token is expected.
+	jwtIdentity string
 }
 
-// beginTokenRequest inspects an outbound token request. For a refresh carrying
-// one of our placeholders it swaps in the real refresh token and returns the
-// row to rotate. For an initial grant it returns a new-login exchange. An
-// unrecognized refresh is left untouched (nil exchange, no capture). The bool
-// reports whether the body was modified.
+// beginTokenRequest inspects an outbound token request and routes by grant
+// type. A refresh carrying one of our placeholders has the real refresh token
+// swapped in, returning the row to rotate. A jwt-bearer request whose issuer
+// matches a configured signer has its (throwaway-signed) assertion replaced by
+// one crinj signs with the real key and its own fixed claims. Any other grant
+// (authorization_code, ...) is a new login to capture. An unrecognized refresh
+// or an unconfigured jwt-bearer issuer is left untouched (nil exchange, no
+// capture). The bool reports whether the body was modified.
 func (e *OAuthEngine) beginTokenRequest(endpoint string, body *tokenBody) (*tokenExchange, bool, error) {
 	gt, _ := body.get("grant_type")
-	if gt == "refresh_token" {
+	switch gt {
+	case "refresh_token":
 		rt, _ := body.get("refresh_token")
 		row, ok, err := e.store.GetByRefresh(rt)
 		if err != nil {
@@ -312,8 +344,21 @@ func (e *OAuthEngine) beginTokenRequest(endpoint string, body *tokenBody) (*toke
 			return &tokenExchange{endpoint: endpoint, refresh: &row}, true, nil
 		}
 		return nil, false, nil
+	case jwtBearerGrant:
+		assertion, _ := body.get("assertion")
+		signer := e.findSigner(endpoint, unverifiedAssertionIssuer(assertion))
+		if signer == nil {
+			return nil, false, nil // issuer we were not configured to broker
+		}
+		signed, err := signer.buildAndSign(e.now())
+		if err != nil {
+			return nil, false, err
+		}
+		body.set("assertion", signed)
+		return &tokenExchange{endpoint: endpoint, jwtIdentity: signer.identity(endpoint)}, true, nil
+	default:
+		return &tokenExchange{endpoint: endpoint, newLogin: true}, false, nil
 	}
-	return &tokenExchange{endpoint: endpoint, newLogin: true}, false, nil
 }
 
 // completeResponse captures the real tokens from a successful token response and
@@ -326,6 +371,28 @@ func (e *OAuthEngine) completeResponse(ex *tokenExchange, body *tokenBody) (bool
 	}
 	at, hasAT := body.get("access_token")
 	rt, hasRT := body.get("refresh_token")
+
+	if ex.jwtIdentity != "" {
+		// jwt-bearer returns an access token and no refresh token. Reuse the
+		// row for this identity so renewals rotate the real token under one
+		// stable placeholder instead of accumulating rows.
+		if !hasAT {
+			return false, nil
+		}
+		row, ok, err := e.store.GetByIdentity(ex.jwtIdentity)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			row = tokenRow{Endpoint: ex.endpoint, Identity: ex.jwtIdentity, IssuedAccess: mintFake(at)}
+		}
+		row.RealAccess = at
+		body.set("access_token", row.IssuedAccess)
+		if err := e.store.Upsert(row); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
 
 	if ex.newLogin {
 		if !hasAT {

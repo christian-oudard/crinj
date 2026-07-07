@@ -24,19 +24,25 @@ CREATE TABLE IF NOT EXISTS token (
 	issued_refresh TEXT NOT NULL,
 	real_access    TEXT NOT NULL,
 	real_refresh   TEXT NOT NULL,
-	endpoint       TEXT NOT NULL
+	endpoint       TEXT NOT NULL,
+	identity       TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS token_by_refresh ON token (issued_refresh);`
+CREATE INDEX IF NOT EXISTS token_by_refresh ON token (issued_refresh);
+CREATE INDEX IF NOT EXISTS token_by_identity ON token (identity);`
 
 // tokenRow is one captured login. issued_* are the placeholders the client
 // holds; real_* are the live tokens; endpoint is the token-endpoint identity
 // that minted them (used to scope where the real access token may be injected).
+// identity is set only for jwt-bearer logins, which carry no refresh token: it
+// keys renewals to one stable placeholder instead of accumulating rows. It is
+// "" for OAuth logins, which are keyed by their placeholders instead.
 type tokenRow struct {
 	IssuedAccess  string
 	IssuedRefresh string
 	RealAccess    string
 	RealRefresh   string
 	Endpoint      string
+	Identity      string
 }
 
 // VaultStore is the SQLite-backed persistence for captured logins.
@@ -73,7 +79,43 @@ func OpenVaultStore(path string) (*VaultStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("initializing vault schema in %s: %w", path, err)
 	}
+	if err := migrateIdentityColumn(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating vault schema in %s: %w", path, err)
+	}
 	return &VaultStore{db: db}, nil
+}
+
+// migrateIdentityColumn adds the identity column to a token table created
+// before jwt-bearer support. CREATE TABLE IF NOT EXISTS leaves a pre-existing
+// table untouched, so an older oauth.db needs the column added explicitly. The
+// add is idempotent: it is skipped when the column already exists.
+func migrateIdentityColumn(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(token)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "identity" {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`ALTER TABLE token ADD COLUMN identity TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS token_by_identity ON token (identity)`)
+	return err
 }
 
 // GetByAccess finds the login a client is presenting on a resource request,
@@ -93,14 +135,24 @@ func (s *VaultStore) GetByRefresh(issuedRefresh string) (tokenRow, bool, error) 
 	return s.queryRow("issued_refresh = ?", issuedRefresh)
 }
 
+// GetByIdentity finds a jwt-bearer login by its authority key so a renewal
+// rotates the existing row instead of minting a new one. An empty key never
+// matches (OAuth rows store the empty string).
+func (s *VaultStore) GetByIdentity(identity string) (tokenRow, bool, error) {
+	if identity == "" {
+		return tokenRow{}, false, nil
+	}
+	return s.queryRow("identity = ?", identity)
+}
+
 // queryRow runs a single-row lookup with a fixed WHERE clause (never user
 // input) and one bound argument.
 func (s *VaultStore) queryRow(where, arg string) (tokenRow, bool, error) {
 	var r tokenRow
 	err := s.db.QueryRow(
-		`SELECT issued_access, issued_refresh, real_access, real_refresh, endpoint FROM token WHERE `+where,
+		`SELECT issued_access, issued_refresh, real_access, real_refresh, endpoint, identity FROM token WHERE `+where,
 		arg,
-	).Scan(&r.IssuedAccess, &r.IssuedRefresh, &r.RealAccess, &r.RealRefresh, &r.Endpoint)
+	).Scan(&r.IssuedAccess, &r.IssuedRefresh, &r.RealAccess, &r.RealRefresh, &r.Endpoint, &r.Identity)
 	if err == sql.ErrNoRows {
 		return tokenRow{}, false, nil
 	}
@@ -115,14 +167,15 @@ func (s *VaultStore) queryRow(where, arg string) (tokenRow, bool, error) {
 // real tokens).
 func (s *VaultStore) Upsert(r tokenRow) error {
 	_, err := s.db.Exec(
-		`INSERT INTO token (issued_access, issued_refresh, real_access, real_refresh, endpoint)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO token (issued_access, issued_refresh, real_access, real_refresh, endpoint, identity)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(issued_access) DO UPDATE SET
 		   issued_refresh = excluded.issued_refresh,
 		   real_access    = excluded.real_access,
 		   real_refresh   = excluded.real_refresh,
-		   endpoint       = excluded.endpoint`,
-		r.IssuedAccess, r.IssuedRefresh, r.RealAccess, r.RealRefresh, r.Endpoint,
+		   endpoint       = excluded.endpoint,
+		   identity       = excluded.identity`,
+		r.IssuedAccess, r.IssuedRefresh, r.RealAccess, r.RealRefresh, r.Endpoint, r.Identity,
 	)
 	if err != nil {
 		return fmt.Errorf("saving token row: %w", err)

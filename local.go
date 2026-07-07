@@ -37,6 +37,7 @@ type tomlHostEntry struct {
 	Source             *string           `toml:"source"`
 	Inject             []tomlInjectEntry `toml:"inject"`
 	OAuth              *tomlHostOAuth    `toml:"oauth"`
+	JWT                *tomlHostJWT      `toml:"jwt"`
 }
 
 // Domains is the `domain` field: one host pattern or a list of patterns handled
@@ -76,6 +77,25 @@ func (d Domains) label() string { return strings.Join(d, ", ") }
 type tomlHostOAuth struct {
 	TokenHost *string `toml:"token-host"`
 	TokenPath *string `toml:"token-path"`
+}
+
+// tomlHostJWT mirrors the [host.jwt] table. Like [host.oauth] it sits under the
+// resource [[host]] and auto-intercepts its token endpoint, but it authenticates
+// by signing a service-account assertion (RFC 7523) rather than swapping a
+// stored token. The claims are fixed here, crinj-side, so a sandboxed client
+// cannot widen its own scope or impersonate a subject. token-host defaults to
+// the resource domain; audience defaults to https://<token-host><token-path>;
+// alg defaults to RS256; sub is optional and opts into domain-wide delegation.
+type tomlHostJWT struct {
+	TokenHost *string `toml:"token-host"`
+	TokenPath *string `toml:"token-path"`
+	Key       *string `toml:"key"`
+	Issuer    *string `toml:"issuer"`
+	Audience  *string `toml:"audience"`
+	Scope     *string `toml:"scope"`
+	Subject   *string `toml:"sub"`
+	Alg       *string `toml:"alg"`
+	Kid       *string `toml:"kid"`
 }
 
 // tomlInjectEntry mirrors a single [[host.inject]] entry.
@@ -170,7 +190,7 @@ func load(path string) ([]ResolvedHost, error) {
 	// synthesized entry the token host would tunnel through unintercepted,
 	// carrying the real tokens. The resource host already has its own [[host]]
 	// (oauth is nested under it); only the token host can be implicit.
-	chains, err := parseOAuthChains(&cfg)
+	chains, err := parseOAuthChains(&cfg, path)
 	if err != nil {
 		return nil, fmt.Errorf("in %s: %w", path, err)
 	}
@@ -204,45 +224,137 @@ func loadOAuth(path string) ([]OAuthChain, error) {
 	if err := toml.Unmarshal(content, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
-	chains, err := parseOAuthChains(&cfg)
+	chains, err := parseOAuthChains(&cfg, path)
 	if err != nil {
 		return nil, fmt.Errorf("in %s: %w", path, err)
 	}
 	return chains, nil
 }
 
-// parseOAuthChains turns each [host.oauth] block into one chain: the resource
-// host is the [[host]] it sits under, token-host defaults to that domain, and
-// token-path is required.
-func parseOAuthChains(cfg *tomlConfig) ([]OAuthChain, error) {
+// parseOAuthChains turns each [host.oauth] and [host.jwt] block into one chain:
+// the resource host is the [[host]] it sits under, token-host defaults to that
+// domain, and token-path is required. A jwt chain additionally carries a signer
+// built from its key. A host may not declare both blocks.
+func parseOAuthChains(cfg *tomlConfig, configPath string) ([]OAuthChain, error) {
 	var chains []OAuthChain
 	for i := range cfg.Host {
 		entry := &cfg.Host[i]
-		o := entry.OAuth
-		if o == nil {
-			continue
-		}
-		if o.TokenPath == nil {
-			return nil, fmt.Errorf("host %q: [host.oauth] requires token-path", entry.Domain.label())
-		}
-		var tokenHost string
-		switch {
-		case o.TokenHost != nil:
-			tokenHost = *o.TokenHost
-		case len(entry.Domain) == 1:
-			tokenHost = entry.Domain[0]
-		default:
+		if entry.OAuth != nil && entry.JWT != nil {
 			return nil, fmt.Errorf(
-				"host %q: [host.oauth] spanning multiple domains must set token-host",
-				entry.Domain.label())
+				"host %q: cannot have both [host.oauth] and [host.jwt]", entry.Domain.label())
 		}
-		chains = append(chains, OAuthChain{
-			TokenHost: tokenHost,
-			TokenPath: *o.TokenPath,
-			Resource:  []string(entry.Domain),
-		})
+		if entry.OAuth != nil {
+			ch, err := oauthChain(entry)
+			if err != nil {
+				return nil, err
+			}
+			chains = append(chains, ch)
+		}
+		if entry.JWT != nil {
+			ch, skip, err := jwtChain(entry, configPath)
+			if err != nil {
+				return nil, err
+			}
+			if !skip {
+				chains = append(chains, ch)
+			}
+		}
 	}
 	return chains, nil
+}
+
+// oauthChain builds the chain for a [host.oauth] block.
+func oauthChain(entry *tomlHostEntry) (OAuthChain, error) {
+	o := entry.OAuth
+	if o.TokenPath == nil {
+		return OAuthChain{}, fmt.Errorf("host %q: [host.oauth] requires token-path", entry.Domain.label())
+	}
+	tokenHost, err := chainTokenHost("oauth", entry, o.TokenHost)
+	if err != nil {
+		return OAuthChain{}, err
+	}
+	return OAuthChain{
+		TokenHost: tokenHost,
+		TokenPath: *o.TokenPath,
+		Resource:  []string(entry.Domain),
+	}, nil
+}
+
+// jwtChain builds the chain for a [host.jwt] block, including its signer. skip
+// is true when the key file is not yet present, so the chain is left out with a
+// warning rather than failing the whole load (mirrors inject secret handling).
+func jwtChain(entry *tomlHostEntry, configPath string) (chain OAuthChain, skip bool, err error) {
+	j := entry.JWT
+	label := entry.Domain.label()
+	if j.TokenPath == nil {
+		return OAuthChain{}, false, fmt.Errorf("host %q: [host.jwt] requires token-path", label)
+	}
+	if j.Key == nil {
+		return OAuthChain{}, false, fmt.Errorf("host %q: [host.jwt] requires key", label)
+	}
+	if j.Issuer == nil {
+		return OAuthChain{}, false, fmt.Errorf("host %q: [host.jwt] requires issuer", label)
+	}
+	if j.Scope == nil {
+		return OAuthChain{}, false, fmt.Errorf("host %q: [host.jwt] requires scope", label)
+	}
+	tokenHost, err := chainTokenHost("jwt", entry, j.TokenHost)
+	if err != nil {
+		return OAuthChain{}, false, err
+	}
+	audience := "https://" + tokenHost + *j.TokenPath
+	if j.Audience != nil {
+		audience = *j.Audience
+	}
+	keyPath := resolveSourcePath(*j.Key, configPath)
+	state, err := validateSecretFile(keyPath)
+	if err != nil {
+		return OAuthChain{}, false, err
+	}
+	if state != secretPopulated {
+		slog.Warn("skipping [host.jwt]: key not available", "domain", label, "key", keyPath)
+		return OAuthChain{}, true, nil
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return OAuthChain{}, false, fmt.Errorf("host %q: reading jwt key %s: %w", label, keyPath, err)
+	}
+	signer, err := NewJWTSigner(
+		*j.Issuer, audience, *j.Scope, strDeref(j.Subject),
+		strDeref(j.Alg), strDeref(j.Kid), keyPEM)
+	if err != nil {
+		return OAuthChain{}, false, fmt.Errorf("host %q: %w", label, err)
+	}
+	return OAuthChain{
+		TokenHost: tokenHost,
+		TokenPath: *j.TokenPath,
+		Resource:  []string(entry.Domain),
+		Signer:    signer,
+	}, false, nil
+}
+
+// chainTokenHost resolves the token host for an oauth/jwt block: an explicit
+// token-host, else the single resource domain. A multi-domain resource must
+// state token-host since there is no single domain to default to.
+func chainTokenHost(block string, entry *tomlHostEntry, tokenHost *string) (string, error) {
+	switch {
+	case tokenHost != nil:
+		return *tokenHost, nil
+	case len(entry.Domain) == 1:
+		return entry.Domain[0], nil
+	default:
+		return "", fmt.Errorf(
+			"host %q: [host.%s] spanning multiple domains must set token-host",
+			entry.Domain.label(), block)
+	}
+}
+
+// strDeref returns the pointed-to string, or "" for a nil pointer.
+func strDeref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // resolveHost builds a fully resolved host. Any failure causes the caller to
