@@ -102,7 +102,7 @@ func main() {
 	defer cancel()
 	go func() {
 		sig := <-sigCh
-		slog.Warn("received signal, shutting down", "signal", sig.String())
+		slog.Info("received signal, shutting down", "signal", sig.String())
 		cancel()
 	}()
 
