@@ -22,10 +22,10 @@ import (
 )
 
 const (
-	dialTimeout     = 30 * time.Second
+	dialTimeout      = 30 * time.Second
 	handshakeTimeout = 15 * time.Second
-	idleTimeout     = 5 * time.Minute
-	keepAlivePeriod = 30 * time.Second
+	idleTimeout      = 5 * time.Minute
+	keepAlivePeriod  = 30 * time.Second
 )
 
 // HTTP gateway server: connection handling, MITM interception, and tunneling.
