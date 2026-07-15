@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,7 +35,7 @@ domain = "*.googleapis.com"
 token-host = "oauth2.googleapis.com"
 token-path = "/token"
 key = "sa-key.pem"
-issuer = "svc@proj.iam.gserviceaccount.com"
+iss = "svc@proj.iam.gserviceaccount.com"
 scope = "https://www.googleapis.com/auth/logging.read"
 `
 
@@ -87,7 +88,7 @@ token-path = "/token"
 [host.jwt]
 token-path = "/token"
 key = "sa-key.pem"
-issuer = "x"
+iss = "x"
 scope = "y"
 `
 	cfgPath := writeJWTConfig(t, cfg)
@@ -98,10 +99,10 @@ scope = "y"
 
 func TestJWTConfigRequiresFields(t *testing.T) {
 	cases := map[string]string{
-		"token-path": `key = "sa-key.pem"` + "\n" + `issuer = "x"` + "\n" + `scope = "y"`,
-		"key":        `token-path = "/token"` + "\n" + `issuer = "x"` + "\n" + `scope = "y"`,
-		"issuer":     `token-path = "/token"` + "\n" + `key = "sa-key.pem"` + "\n" + `scope = "y"`,
-		"scope":      `token-path = "/token"` + "\n" + `key = "sa-key.pem"` + "\n" + `issuer = "x"`,
+		"token-path": `key = "sa-key.pem"` + "\n" + `iss = "x"` + "\n" + `scope = "y"`,
+		"key":        `token-path = "/token"` + "\n" + `iss = "x"` + "\n" + `scope = "y"`,
+		"iss":        `token-path = "/token"` + "\n" + `key = "sa-key.pem"` + "\n" + `scope = "y"`,
+		"scope":      `token-path = "/token"` + "\n" + `key = "sa-key.pem"` + "\n" + `iss = "x"`,
 	}
 	for missing, block := range cases {
 		cfg := "[[host]]\ndomain = \"api.example.com\"\n[host.jwt]\n" + block + "\n"
@@ -110,6 +111,53 @@ func TestJWTConfigRequiresFields(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), missing) {
 			t.Errorf("missing %s: expected error naming it, got %v", missing, err)
 		}
+	}
+}
+
+// key-path lets the key file stay an intact service-account JSON: crinj pulls
+// the PEM from the named leaf instead of requiring a split-out .pem.
+func TestJWTConfigExtractsKeyFromJSON(t *testing.T) {
+	dir := t.TempDir()
+	key, pemBytes := testRSAKey(t)
+	secrets := filepath.Join(dir, "secrets")
+	if err := os.MkdirAll(secrets, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	quotedPEM, err := json.Marshal(string(pemBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	saJSON := `{"type":"service_account","private_key":` +
+		string(quotedPEM) +
+		`,"client_email":"svc@proj.iam.gserviceaccount.com"}`
+	if err := os.WriteFile(filepath.Join(secrets, "sa-key.json"), []byte(saJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `
+[[host]]
+domain = "*.googleapis.com"
+[host.jwt]
+token-host = "oauth2.googleapis.com"
+token-path = "/token"
+key = "sa-key.json"
+key-path = "private_key"
+iss = "svc@proj.iam.gserviceaccount.com"
+scope = "https://www.googleapis.com/auth/logging.read"
+`
+	cfgPath := filepath.Join(dir, "rules.toml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	chains, err := loadOAuth(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chains) != 1 || chains[0].Signer == nil {
+		t.Fatalf("expected one chain with a signer, got %d", len(chains))
+	}
+	// The extracted key must be the one that signs, not some other key.
+	if !chains[0].Signer.key.PublicKey.Equal(&key.PublicKey) {
+		t.Error("signer is not using the key extracted from the JSON")
 	}
 }
 

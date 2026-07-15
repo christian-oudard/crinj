@@ -84,14 +84,17 @@ type tomlHostOAuth struct {
 // by signing a service-account assertion (RFC 7523) rather than swapping a
 // stored token. The claims are fixed here, crinj-side, so a sandboxed client
 // cannot widen its own scope or impersonate a subject. token-host defaults to
-// the resource domain; audience defaults to https://<token-host><token-path>;
-// alg defaults to RS256; sub is optional and opts into domain-wide delegation.
+// the resource domain; aud defaults to https://<token-host><token-path>; alg
+// defaults to RS256; sub is optional and opts into domain-wide delegation.
+// key-path optionally extracts the PEM from a structured key file (e.g. an
+// intact service-account JSON) instead of reading key as a raw PEM.
 type tomlHostJWT struct {
 	TokenHost *string `toml:"token-host"`
 	TokenPath *string `toml:"token-path"`
 	Key       *string `toml:"key"`
-	Issuer    *string `toml:"issuer"`
-	Audience  *string `toml:"audience"`
+	KeyPath   *string `toml:"key-path"`
+	Issuer    *string `toml:"iss"`
+	Audience  *string `toml:"aud"`
 	Scope     *string `toml:"scope"`
 	Subject   *string `toml:"sub"`
 	Alg       *string `toml:"alg"`
@@ -293,7 +296,7 @@ func jwtChain(entry *tomlHostEntry, configPath string) (chain OAuthChain, skip b
 		return OAuthChain{}, false, fmt.Errorf("host %q: [host.jwt] requires key", label)
 	}
 	if j.Issuer == nil {
-		return OAuthChain{}, false, fmt.Errorf("host %q: [host.jwt] requires issuer", label)
+		return OAuthChain{}, false, fmt.Errorf("host %q: [host.jwt] requires iss", label)
 	}
 	if j.Scope == nil {
 		return OAuthChain{}, false, fmt.Errorf("host %q: [host.jwt] requires scope", label)
@@ -318,6 +321,15 @@ func jwtChain(entry *tomlHostEntry, configPath string) (chain OAuthChain, skip b
 	keyPEM, err := os.ReadFile(keyPath)
 	if err != nil {
 		return OAuthChain{}, false, fmt.Errorf("host %q: reading jwt key %s: %w", label, keyPath, err)
+	}
+	// With key-path, the key file is a structured secret (e.g. an intact
+	// service-account JSON) and the PEM is the leaf at that dot-path.
+	if j.KeyPath != nil {
+		pem, err := extractPath(string(keyPEM), *j.KeyPath, keyPath)
+		if err != nil {
+			return OAuthChain{}, false, fmt.Errorf("host %q: extracting jwt key-path %q: %w", label, *j.KeyPath, err)
+		}
+		keyPEM = []byte(pem)
 	}
 	signer, err := NewJWTSigner(
 		*j.Issuer, audience, *j.Scope, strDeref(j.Subject),

@@ -139,16 +139,19 @@ domain = "*.googleapis.com"
 [host.jwt]
 token-host = "oauth2.googleapis.com"   # defaults to the resource domain
 token-path = "/token"
-key = "sa-key.pem"                      # source path to the real private key (PKCS#1 or PKCS#8 PEM)
-issuer = "svc@proj.iam.gserviceaccount.com"
+key = "rhs-readonly.json"               # source path to the key file (mode 0600)
+key-path = "private_key"                # dot-path to the PEM inside a structured key file
+iss = "svc@proj.iam.gserviceaccount.com"
 scope = "https://www.googleapis.com/auth/logging.read"
-# audience defaults to https://<token-host><token-path>
+# aud defaults to https://<token-host><token-path>
 # alg defaults to RS256 (RS256/RS384/RS512 supported)
 # kid optional (JWS header; set to the key's private_key_id so Google selects the cert)
 # sub optional; setting it opts into domain-wide-delegation impersonation
 ```
 
-The claims crinj puts in the assertion (`iss`, `scope`, optional `sub`, `aud`, `iat`, `exp`) are fixed by config, not copied from the client's assertion, so a sandboxed client cannot widen its own scope or impersonate a subject. `iat`/`exp` come from crinj's clock with a one-hour lifetime (Google's cap). The key is read at startup from a source file (mode 0600, like any secret); an absent key skips the block with a warning rather than failing the load.
+`key` names the key file. Without `key-path` it is read as a raw PEM (PKCS#1 or PKCS#8). With `key-path` the file is a structured secret (JSON/TOML, dispatched by extension) and the PEM is the leaf at that dot-path, so an intact service-account JSON can be dropped in unmodified (`key-path = "private_key"`) with no `jq` extraction step.
+
+The endpoint/key fields (`token-host`, `token-path`, `key`, `key-path`) use crinj's kebab-case convention; the assertion fields use their canonical names — the RFC 7519 claims `iss`, `aud`, `sub`, `scope` and the RFC 7515 JWS headers `alg`, `kid`. The claims crinj puts in the assertion (`iss`, `scope`, optional `sub`, `aud`, `iat`, `exp`) are fixed by config, not copied from the client's assertion, so a sandboxed client cannot widen its own scope or impersonate a subject. `iat`/`exp` come from crinj's clock with a one-hour lifetime (Google's cap). The key is read at startup from a source file (mode 0600, like any secret); an absent key skips the block with a warning rather than failing the load.
 
 The flow reuses the OAuth machinery. At the token endpoint:
 
