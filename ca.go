@@ -233,7 +233,8 @@ func (ca *CertificateAuthority) ServerConfigForHost(hostname string) (*tls.Confi
 }
 
 // generateLeaf signs a per-hostname leaf certificate and packages it into a
-// *tls.Config with ALPN locked to http/1.1 (we don't speak HTTP/2 upstream).
+// *tls.Config offering both HTTP/2 and HTTP/1.1 via ALPN. The client picks;
+// the MITM loop serves whichever it chose (h2 clients like gRPC need h2).
 func (ca *CertificateAuthority) generateLeaf(hostname string) (*tls.Config, error) {
 	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -270,7 +271,7 @@ func (ca *CertificateAuthority) generateLeaf(hostname string) (*tls.Config, erro
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"http/1.1"},
+		NextProtos:   []string{"h2", "http/1.1"},
 	}, nil
 }
 

@@ -15,7 +15,7 @@
       # Pure-Go SQLite (modernc.org/sqlite) keeps cgo off and the build fast.
       env.CGO_ENABLED = "0";
 
-      vendorHash = "sha256-5YluHJOf6JfdFsglR9EKrTwZmw558eglAiXhwmFTdsc=";
+      vendorHash = "sha256-3/KUqv7vAmnrQ1xY+DouZQAsPwhQ7DjXd/i9Usfki0c=";
 
       ldflags = [
         "-s" "-w"

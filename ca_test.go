@@ -104,8 +104,8 @@ func TestLeafCertGeneratesValidServerConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ServerConfigForHost: %v", err)
 	}
-	if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != "http/1.1" {
-		t.Errorf("NextProtos=%v want [http/1.1]", cfg.NextProtos)
+	if len(cfg.NextProtos) != 2 || cfg.NextProtos[0] != "h2" || cfg.NextProtos[1] != "http/1.1" {
+		t.Errorf("NextProtos=%v want [h2 http/1.1]", cfg.NextProtos)
 	}
 	if len(cfg.Certificates) != 1 {
 		t.Fatalf("Certificates len=%d want 1", len(cfg.Certificates))
@@ -218,7 +218,7 @@ func TestLeafSignedByPersistedCAIsValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ServerConfigForHost: %v", err)
 	}
-	if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != "http/1.1" {
+	if len(cfg.NextProtos) != 2 || cfg.NextProtos[0] != "h2" || cfg.NextProtos[1] != "http/1.1" {
 		t.Errorf("NextProtos=%v", cfg.NextProtos)
 	}
 	leaf, err := x509.ParseCertificate(cfg.Certificates[0].Certificate[0])

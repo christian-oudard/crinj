@@ -411,6 +411,10 @@ func mitm(
 	_ = tlsClient.SetDeadline(time.Time{})
 	defer tlsClient.Close()
 
+	if tlsClient.ConnectionState().NegotiatedProtocol == "h2" {
+		return mitmH2(tlsClient, host, hostname, upstreamTLS, upstreamProxy, access, rules, oauth)
+	}
+
 	target := host
 	if !strings.Contains(host, ":") {
 		target = host + ":443"

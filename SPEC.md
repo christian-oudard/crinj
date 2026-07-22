@@ -7,7 +7,7 @@ A local MITM proxy for sandboxing tools (typically AI agents) that need API acce
 1. The agent is pointed at crinj as its HTTPS proxy.
 2. For each outbound `CONNECT`, crinj selects one matching host entry from its config.
    - If no host entry matches, traffic is tunneled through unchanged.
-   - If one matches, crinj terminates TLS, generates a leaf cert on the fly, and forwards.
+   - If one matches, crinj terminates TLS, generates a leaf cert on the fly, and forwards. The leaf offers both HTTP/2 and HTTP/1.1 over ALPN; crinj serves whichever the client negotiates (h2 clients such as gRPC work end-to-end, trailers included).
 3. For each request on a matched host, crinj evaluates access control then applies inject entries.
 
 ## Config
@@ -235,4 +235,3 @@ Secret files must have mode 0o600 (no group/world access) or crinj refuses to st
 - Not a general-purpose reverse proxy.
 - Not a secret store. Credentials live on disk as plain files; crinj only reads them.
 - No outbound proxy auth (user:pass@host not supported in `HTTPS_PROXY`).
-- No HTTP/2 upstream. HTTP/1.1 only.
