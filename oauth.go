@@ -346,7 +346,8 @@ func (e *OAuthEngine) beginTokenRequest(endpoint string, body *tokenBody) (*toke
 		return nil, false, nil
 	case jwtBearerGrant:
 		assertion, _ := body.get("assertion")
-		signer := e.findSigner(endpoint, unverifiedAssertionIssuer(assertion))
+		iss, _ := unverifiedClaims(assertion)
+		signer := e.findSigner(endpoint, iss)
 		if signer == nil {
 			return nil, false, nil // issuer we were not configured to broker
 		}
@@ -452,4 +453,31 @@ func (e *OAuthEngine) resourceBearer(endpoint, authHeader string) (string, bool,
 		return "", false, nil
 	}
 	return "Bearer " + row.RealAccess, true, nil
+}
+
+// resignResourceBearer re-signs a self-signed JWT bearer on a resource host.
+// Some clients skip the token endpoint entirely and send a JWT they sign
+// themselves as the bearer (Google's GAPIC libraries do, by default); the
+// sandboxed client's copy is signed with its throwaway key, so crinj replaces
+// it with one signed by the real key, claims fixed by config as always. ok is
+// false when the bearer is not a JWT from an issuer we are configured to sign
+// for; the request is then forwarded untouched.
+func (e *OAuthEngine) resignResourceBearer(endpoint, authHeader string) (string, bool, error) {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authHeader, prefix) {
+		return "", false, nil
+	}
+	iss, aud := unverifiedClaims(authHeader[len(prefix):])
+	if iss == "" {
+		return "", false, nil
+	}
+	signer := e.findSigner(endpoint, iss)
+	if signer == nil {
+		return "", false, nil
+	}
+	signed, err := signer.selfSignBearer(e.now(), aud)
+	if err != nil {
+		return "", false, err
+	}
+	return prefix + signed, true, nil
 }

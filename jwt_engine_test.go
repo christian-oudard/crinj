@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -79,7 +80,7 @@ func TestEngineJWTBearerSignsAndCaptures(t *testing.T) {
 		t.Fatal("assertion was not replaced")
 	}
 	verifyRS256(t, signed, pub)
-	if iss := unverifiedAssertionIssuer(signed); iss != jwtIssuer {
+	if iss, _ := unverifiedClaims(signed); iss != jwtIssuer {
 		t.Errorf("crinj assertion iss = %q", iss)
 	}
 
@@ -122,6 +123,96 @@ func TestEngineJWTBearerIssuerMismatchPassesThrough(t *testing.T) {
 	}
 	if got := mustGet(t, req, "assertion"); got != original {
 		t.Error("assertion mutated for an issuer we do not broker")
+	}
+}
+
+// decodeJWTSegment decodes one base64url JWT segment as JSON.
+func decodeJWTSegment(t *testing.T, seg string) map[string]any {
+	t.Helper()
+	b, err := base64.RawURLEncoding.DecodeString(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func TestEngineResignsSelfSignedJWTBearer(t *testing.T) {
+	e, endpoint, pub := jwtTestEngine(t)
+
+	bearer, ok, err := e.resignResourceBearer(endpoint, "Bearer "+clientAssertion(jwtIssuer))
+	if err != nil || !ok {
+		t.Fatalf("resignResourceBearer: ok=%v err=%v", ok, err)
+	}
+	signed := strings.TrimPrefix(bearer, "Bearer ")
+	verifyRS256(t, signed, pub)
+
+	parts := strings.Split(signed, ".")
+	header := decodeJWTSegment(t, parts[0])
+	if header["kid"] != "kid1" {
+		t.Errorf("kid = %v", header["kid"])
+	}
+	claims := decodeJWTSegment(t, parts[1])
+	if claims["iss"] != jwtIssuer || claims["sub"] != jwtIssuer {
+		t.Errorf("iss = %v, sub = %v", claims["iss"], claims["sub"])
+	}
+	// Authority claims are crinj-fixed: the configured scope wins and the
+	// client's aud ("x" in clientAssertion) is dropped.
+	if claims["scope"] != "https://www.googleapis.com/auth/logging.read" {
+		t.Errorf("scope = %v", claims["scope"])
+	}
+	if _, present := claims["aud"]; present {
+		t.Errorf("aud should be dropped when a scope is configured, got %v", claims["aud"])
+	}
+	if exp, iat := claims["exp"].(float64), claims["iat"].(float64); exp-iat != 3600 {
+		t.Errorf("lifetime = %v seconds, want 3600", exp-iat)
+	}
+}
+
+func TestEngineResignKeepsClientAudWithoutScope(t *testing.T) {
+	priv, pemBytes := testRSAKey(t)
+	signer, err := NewJWTSigner(jwtIssuer, "https://oauth2.googleapis.com/token",
+		"", "", "", "", pemBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := OAuthChain{
+		TokenHost: "oauth2.googleapis.com",
+		TokenPath: "/token",
+		Resource:  []string{"*.googleapis.com"},
+		Signer:    signer,
+	}
+	e := NewOAuthEngine([]OAuthChain{chain}, openTestStore(t))
+	e.now = func() time.Time { return time.Unix(1_700_000_000, 0) }
+
+	bearer, ok, err := e.resignResourceBearer(chain.endpoint(), "Bearer "+clientAssertion(jwtIssuer))
+	if err != nil || !ok {
+		t.Fatalf("resignResourceBearer: ok=%v err=%v", ok, err)
+	}
+	signed := strings.TrimPrefix(bearer, "Bearer ")
+	verifyRS256(t, signed, &priv.PublicKey)
+	claims := decodeJWTSegment(t, strings.Split(signed, ".")[1])
+	if claims["aud"] != "x" {
+		t.Errorf("aud = %v, want client's own aud kept", claims["aud"])
+	}
+	if _, present := claims["scope"]; present {
+		t.Errorf("scope should be absent, got %v", claims["scope"])
+	}
+}
+
+func TestEngineResignPassesThroughForeignBearers(t *testing.T) {
+	e, endpoint, _ := jwtTestEngine(t)
+	for _, auth := range []string{
+		"Bearer ya29.crinj-placeholder-notajwt", // opaque token, not a JWT
+		"Bearer " + clientAssertion("stranger@evil.com"),
+		"Basic dXNlcjpwYXNz",
+	} {
+		if _, ok, err := e.resignResourceBearer(endpoint, auth); ok || err != nil {
+			t.Errorf("resignResourceBearer(%q) = ok=%v err=%v, want pass-through", auth, ok, err)
+		}
 	}
 }
 

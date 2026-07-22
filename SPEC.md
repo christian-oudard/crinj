@@ -161,6 +161,8 @@ The flow reuses the OAuth machinery. At the token endpoint:
 
 Because there is no refresh token to key renewals by, a jwt-bearer login is keyed in the vault by its authority (token endpoint plus the fixed claims), so a renewal rotates the existing row under one stable placeholder instead of accumulating rows. The vault is the same `oauth.db`; a service-account access token is an OAuth token regardless of how it was obtained.
 
+Some clients skip the token endpoint entirely and send a **self-signed JWT** as the bearer itself (Google AIP-4111; the Google GAPIC client libraries do this by default, on both gRPC and REST transports). crinj brokers this flavor at the resource host: a `Bearer` value that is a JWT whose `iss` matches a configured signer is replaced with a JWT crinj signs from the same fixed claims (`sub` defaults to the issuer; the client's `aud` is kept only when no `scope` is configured, since it names the one service the token is good for). A JWT from an unconfigured issuer, or any non-JWT bearer that is not a vault placeholder, passes through untouched. This makes stock Google client libraries work unmodified, with no scope forcing or transport overrides on the client side.
+
 ### Glob patterns
 
 `*` is the only metacharacter, matches any sequence of characters. Used in both domain and URL-path patterns.

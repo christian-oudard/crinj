@@ -573,9 +573,10 @@ func prepareUpstreamRequest(req *http.Request, access []AccessEntry, rules []Inj
 // applyOAuthRequest applies the request side of OAuth passthrough to a request
 // already prepared for the upstream (headers filtered, URI path-only). On a
 // resource host it swaps the client's placeholder bearer for the real access
-// token. On the token endpoint it buffers the body and swaps the placeholder
-// refresh token for the real one, returning an exchange so the response can be
-// captured. Returns nil when there is nothing to capture on the response.
+// token, or re-signs a self-signed JWT bearer with the real key. On the token
+// endpoint it buffers the body and swaps the placeholder refresh token for the
+// real one, returning an exchange so the response can be captured. Returns nil
+// when there is nothing to capture on the response.
 func applyOAuthRequest(req *http.Request, hostname string, oauth *OAuthEngine) (*tokenExchange, error) {
 	if oauth == nil {
 		return nil, nil
@@ -586,6 +587,12 @@ func applyOAuthRequest(req *http.Request, hostname string, oauth *OAuthEngine) (
 			bearer, ok, err := oauth.resourceBearer(endpoint, auth)
 			if err != nil {
 				return nil, err
+			}
+			if !ok {
+				bearer, ok, err = oauth.resignResourceBearer(endpoint, auth)
+				if err != nil {
+					return nil, err
+				}
 			}
 			if ok {
 				req.Header.Set("Authorization", bearer)

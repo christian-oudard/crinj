@@ -98,6 +98,47 @@ header = "x-modal-token-secret"
 | `remove-header` | Header to remove (no value needed) |
 | `format` | Format string, `{}` is replaced with the resolved value (e.g. `"Bearer {}"`) |
 
+## OAuth & JWT token brokering
+
+Beyond static injection, crinj can broker a full OAuth 2.0 or JWT-bearer flow so a sandboxed client never holds a usable refresh token or private key. crinj captures the real tokens at the provider's token endpoint into a server-side vault and hands the client opaque **placeholders**; on each request to the resource host it swaps the placeholder back for the real token. The token host is auto-intercepted and needs no `[[host]]` of its own. See `SPEC.md` for the mechanism.
+
+### OAuth (opaque-token providers)
+
+```toml
+[[host]]
+domain = "api.anthropic.com"        # the resource host
+[host.oauth]
+token-host = "platform.claude.com"
+token-path = "/v1/oauth/token"
+```
+
+### JWT-bearer (Google service accounts / gcloud)
+
+For a service account the client signs a short-lived assertion with a private key rather than sending a bearer secret. crinj holds the real key and re-signs the assertion; the sandboxed client holds only a throwaway key.
+
+```toml
+[[host]]
+domain = "*.googleapis.com"         # resource hosts: logging, storage, ...
+[host.jwt]
+token-host = "oauth2.googleapis.com"
+token-path = "/token"
+key = "gcp-service-account.json"    # the real key, crinj-side only
+key-path = "private_key"
+iss = "readonly@my-project.iam.gserviceaccount.com"
+scope = "https://www.googleapis.com/auth/cloud-platform"
+kid = "<private_key_id>"            # so Google selects the signing cert
+```
+
+The sandboxed copy of the key file keeps a **valid-PEM but throwaway** `private_key`; only crinj's copy has the real key. The client assembles a well-formed but unusable assertion, and crinj replaces it.
+
+Both service-account flavors are brokered: the RFC 7523 token exchange (assertion re-signed at the token endpoint, access token vaulted and placeheld) and **self-signed JWT bearers** (Google AIP-4111, the GAPIC client libraries' default), which crinj re-signs directly at the resource host. Stock Google client libraries work unmodified, over both gRPC and REST.
+
+### Client setup for Google Cloud
+
+- **Trust the CA.** Point the client at crinj's CA. Most tools read `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE`, but **gRPC's C-core ignores those** — it reads `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`. Set it to a bundle containing crinj's CA.
+- **HTTP/2 and gRPC** are supported: the leaf advertises `h2` over ALPN and crinj bridges h2 (including gRPC trailers) end-to-end.
+- **Don't diagnose with raw curl.** `curl -H "Authorization: Bearer <placeholder>"` straight at a resource endpoint always 401s — there is no token exchange for crinj to intercept, and a hand-built header is not a JWT crinj re-signs. Drive a real client (google-auth, gcloud, a GAPIC library).
+
 ## NixOS
 
 ```nix

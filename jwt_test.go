@@ -146,17 +146,17 @@ func TestJWTSignerRejectsGarbageKey(t *testing.T) {
 	}
 }
 
-func TestUnverifiedAssertionIssuer(t *testing.T) {
-	// A well-formed (but irrelevantly-signed) assertion yields its iss.
+func TestUnverifiedClaims(t *testing.T) {
+	// A well-formed (but irrelevantly-signed) token yields its iss and aud.
 	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"who@example.com","aud":"x"}`))
-	assertion := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)) + "." + payload + ".sig"
-	if got := unverifiedAssertionIssuer(assertion); got != "who@example.com" {
-		t.Errorf("iss = %q", got)
+	token := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)) + "." + payload + ".sig"
+	if iss, aud := unverifiedClaims(token); iss != "who@example.com" || aud != "x" {
+		t.Errorf("iss = %q, aud = %q", iss, aud)
 	}
 	// Malformed inputs yield "".
 	for _, bad := range []string{"", "onlyonesegment", "a.!!!notbase64!!!.c", "a." + base64.RawURLEncoding.EncodeToString([]byte("not json")) + ".c"} {
-		if got := unverifiedAssertionIssuer(bad); got != "" {
-			t.Errorf("unverifiedAssertionIssuer(%q) = %q, want empty", bad, got)
+		if iss, aud := unverifiedClaims(bad); iss != "" || aud != "" {
+			t.Errorf("unverifiedClaims(%q) = %q, %q, want empty", bad, iss, aud)
 		}
 	}
 }

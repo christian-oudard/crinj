@@ -232,6 +232,106 @@ func TestMITMH2AccessBlockReturnsSynthetic(t *testing.T) {
 	}
 }
 
+// TestMITMH2SwapsResourceBearer proves the OAuth resource swap works over h2:
+// the client sends a crinj placeholder bearer and the upstream must see the
+// real token. This is exactly the gRPC-to-Cloud-Logging path.
+func TestMITMH2SwapsResourceBearer(t *testing.T) {
+	upstream := h2Upstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "auth=%s", r.Header.Get("Authorization"))
+	}))
+	target := strings.TrimPrefix(upstream.URL, "https://")
+	hostname := stripPort(target)
+
+	// OAuth engine with the upstream as a resource host; seed a placeholder ->
+	// real access-token mapping via a captured login.
+	store := openTestStore(t)
+	chain := OAuthChain{TokenHost: "token.example", TokenPath: "/token", Resource: []string{hostname}}
+	oauth := NewOAuthEngine([]OAuthChain{chain}, store)
+	ex, _, err := oauth.beginTokenRequest(chain.endpoint(),
+		&tokenBody{json: map[string]any{"grant_type": "authorization_code", "code": "x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &tokenBody{json: map[string]any{
+		"access_token": "REAL-ACCESS-TOKEN", "refresh_token": "REAL-REFRESH", "expires_in": float64(3600)}}
+	if _, err := oauth.completeResponse(ex, resp); err != nil {
+		t.Fatal(err)
+	}
+	placeholder, _ := resp.get("access_token")
+
+	ca, _ := generateCA()
+	srv := &GatewayServer{
+		ca:                 ca,
+		upstreamTLS:        buildUpstreamTLSConfig(false),
+		upstreamTLSNoCheck: buildUpstreamTLSConfig(true),
+		oauth:              oauth,
+		rules:              []ResolvedHost{{HostPattern: hostname, NoCheckCertificate: true}},
+	}
+	addr := startProxy(t, srv)
+	cc := dialH2ThroughProxy(t, addr, target, hostname, ca)
+
+	req, _ := http.NewRequest("GET", "https://"+hostname+"/v2/entries:list", nil)
+	req.Header.Set("Authorization", "Bearer "+placeholder)
+	got, err := cc.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	body, _ := io.ReadAll(got.Body)
+	got.Body.Close()
+	if !strings.Contains(string(body), "auth=Bearer REAL-ACCESS-TOKEN") {
+		t.Errorf("resource bearer not swapped over h2, upstream saw body=%q", body)
+	}
+}
+
+// TestMITMH2ResignsSelfSignedJWT proves the self-signed JWT re-sign works over
+// h2: the client sends a JWT signed with its throwaway key (what Google GAPIC
+// clients do by default, skipping the token endpoint) and the upstream must
+// see one signed with the real key.
+func TestMITMH2ResignsSelfSignedJWT(t *testing.T) {
+	var upstreamAuth string
+	upstream := h2Upstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAuth = r.Header.Get("Authorization")
+		fmt.Fprint(w, "ok")
+	}))
+	target := strings.TrimPrefix(upstream.URL, "https://")
+	hostname := stripPort(target)
+
+	priv, pemBytes := testRSAKey(t)
+	signer, err := NewJWTSigner(jwtIssuer, "https://token.example/token",
+		"scope-a", "", "", "kid1", pemBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain := OAuthChain{TokenHost: "token.example", TokenPath: "/token",
+		Resource: []string{hostname}, Signer: signer}
+	oauth := NewOAuthEngine([]OAuthChain{chain}, openTestStore(t))
+
+	ca, _ := generateCA()
+	srv := &GatewayServer{
+		ca:                 ca,
+		upstreamTLS:        buildUpstreamTLSConfig(false),
+		upstreamTLSNoCheck: buildUpstreamTLSConfig(true),
+		oauth:              oauth,
+		rules:              []ResolvedHost{{HostPattern: hostname, NoCheckCertificate: true}},
+	}
+	addr := startProxy(t, srv)
+	cc := dialH2ThroughProxy(t, addr, target, hostname, ca)
+
+	throwaway := clientAssertion(jwtIssuer)
+	req, _ := http.NewRequest("GET", "https://"+hostname+"/v2/entries:list", nil)
+	req.Header.Set("Authorization", "Bearer "+throwaway)
+	got, err := cc.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	got.Body.Close()
+
+	if upstreamAuth == "Bearer "+throwaway {
+		t.Fatal("throwaway-signed JWT reached the upstream unmodified")
+	}
+	verifyRS256(t, strings.TrimPrefix(upstreamAuth, "Bearer "), &priv.PublicKey)
+}
+
 // TestMITMHTTP1StillWorksAfterH2ALPN guards the fallback: a client that only
 // offers http/1.1 must still be served by the HTTP/1.1 loop now that the leaf
 // advertises both protocols.

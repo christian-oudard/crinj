@@ -85,10 +85,6 @@ func (s *JWTSigner) identity(endpoint string) string {
 // exceeds one hour); the client's incoming assertion contributes nothing but
 // its issuer, matched upstream in beginTokenRequest.
 func (s *JWTSigner) buildAndSign(now time.Time) (string, error) {
-	header := map[string]any{"alg": s.alg, "typ": "JWT"}
-	if s.Kid != "" {
-		header["kid"] = s.Kid
-	}
 	claims := map[string]any{
 		"iss": s.Issuer,
 		"aud": s.Audience,
@@ -100,6 +96,42 @@ func (s *JWTSigner) buildAndSign(now time.Time) (string, error) {
 	}
 	if s.Subject != "" {
 		claims["sub"] = s.Subject
+	}
+	return s.signClaims(claims)
+}
+
+// selfSignBearer mints a self-signed JWT bearer: the flavor of service-account
+// auth where the JWT itself is the access credential, sent straight to the
+// resource host with no token exchange (Google AIP-4111; the GAPIC client
+// libraries do this by default). Authority claims are crinj-fixed like
+// buildAndSign; sub is required by the provider here and defaults to the
+// issuer. When no scope is configured the client's own aud is kept — it names
+// the one service the token is good for, so it narrows rather than widens.
+func (s *JWTSigner) selfSignBearer(now time.Time, clientAud string) (string, error) {
+	sub := s.Subject
+	if sub == "" {
+		sub = s.Issuer
+	}
+	claims := map[string]any{
+		"iss": s.Issuer,
+		"sub": sub,
+		"iat": now.Unix(),
+		"exp": now.Add(time.Hour).Unix(),
+	}
+	if s.Scope != "" {
+		claims["scope"] = s.Scope
+	} else if clientAud != "" {
+		claims["aud"] = clientAud
+	}
+	return s.signClaims(claims)
+}
+
+// signClaims signs claims into a compact JWS with the signer's key, alg, and
+// kid.
+func (s *JWTSigner) signClaims(claims map[string]any) (string, error) {
+	header := map[string]any{"alg": s.alg, "typ": "JWT"}
+	if s.Kid != "" {
+		header["kid"] = s.Kid
 	}
 	signingInput, err := jwtSigningInput(header, claims)
 	if err != nil {
@@ -153,25 +185,26 @@ func parseRSAPrivateKey(pemBytes []byte) (*rsa.PrivateKey, error) {
 	return key, nil
 }
 
-// unverifiedAssertionIssuer extracts the `iss` claim from a JWT WITHOUT
-// verifying its signature. crinj uses it only to route an incoming jwt-bearer
-// request to the matching signer; the client's assertion is signed with a
-// throwaway key and is otherwise discarded, so there is nothing to verify. A
-// malformed assertion yields "".
-func unverifiedAssertionIssuer(assertion string) string {
-	parts := strings.Split(assertion, ".")
+// unverifiedClaims extracts the `iss` and `aud` claims from a JWT WITHOUT
+// verifying its signature. crinj uses them only to route an incoming JWT to
+// the matching signer; the client's JWT is signed with a throwaway key and is
+// otherwise discarded, so there is nothing to verify. A malformed token
+// yields empty strings.
+func unverifiedClaims(token string) (iss, aud string) {
+	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
-		return ""
+		return "", ""
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	var claims struct {
 		Iss string `json:"iss"`
+		Aud string `json:"aud"`
 	}
 	if err := json.Unmarshal(payload, &claims); err != nil {
-		return ""
+		return "", ""
 	}
-	return claims.Iss
+	return claims.Iss, claims.Aud
 }
