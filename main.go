@@ -15,6 +15,10 @@ import (
 	"time"
 )
 
+// commit is the git revision this binary was built from, injected via
+// -ldflags "-X main.commit=..." in flake.nix. Reported by /healthz.
+var commit = "unknown"
+
 // CLI entry point: parses flags, resolves XDG paths, sets up logging, loads
 // the CA + config, and runs the gateway server until SIGINT/SIGTERM.
 

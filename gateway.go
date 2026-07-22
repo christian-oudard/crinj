@@ -268,7 +268,9 @@ func (s *GatewayServer) handleConnection(conn net.Conn) {
 		return
 	}
 	if req.URL.Path == "/healthz" {
-		writeSimpleResponse(conn, http.StatusOK)
+		body := fmt.Sprintf("{\"commit\":%q}\n", commit)
+		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"+
+			"Content-Length: %d\r\n\r\n%s", len(body), body)
 		return
 	}
 	writeSimpleResponse(conn, http.StatusBadRequest)

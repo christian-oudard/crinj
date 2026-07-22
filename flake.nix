@@ -17,7 +17,10 @@
 
       vendorHash = "sha256-5YluHJOf6JfdFsglR9EKrTwZmw558eglAiXhwmFTdsc=";
 
-      ldflags = [ "-s" "-w" ];
+      ldflags = [
+        "-s" "-w"
+        "-X" "main.commit=${self.shortRev or self.dirtyShortRev or "unknown"}"
+      ];
     };
 
   in {

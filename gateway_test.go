@@ -970,6 +970,11 @@ func TestHandleConnectionHealthzReturns200(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Errorf("status=%d want 200", resp.StatusCode)
 	}
+	body, _ := io.ReadAll(resp.Body)
+	want := fmt.Sprintf("{\"commit\":%q}\n", commit)
+	if string(body) != want {
+		t.Errorf("body=%q want %q", body, want)
+	}
 	resp.Body.Close()
 	<-done
 }
